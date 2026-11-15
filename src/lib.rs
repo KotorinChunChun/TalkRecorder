@@ -12,6 +12,8 @@ pub mod engine;
 pub mod finalize;
 pub mod journal;
 pub mod maintenance;
+#[cfg(windows)]
+mod management;
 pub mod power;
 pub mod recovery;
 pub mod single_instance;

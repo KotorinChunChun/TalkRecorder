@@ -117,5 +117,15 @@ fn main() -> anyhow::Result<()> {
         anyhow::ensure!(report.errors.is_empty(), "圧縮できないWAVは保持しました");
         return Ok(());
     }
-    talk_recorder::ui::run(path)
+    let origin = match args
+        .windows(2)
+        .find(|pair| pair[0] == "--launch-origin")
+        .map(|pair| pair[1].as_str())
+    {
+        Some("host_manual") => "host_manual",
+        Some("via_kotorintoys") => "via_kotorintoys",
+        Some("direct_task") => "direct_task",
+        _ => "standalone",
+    };
+    talk_recorder::ui::run(path, args.iter().any(|arg| arg == "--startup"), origin)
 }

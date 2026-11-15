@@ -60,6 +60,7 @@ pub struct Config {
     pub reconnect_secs: f64,
     pub prevent_sleep: bool,
     pub auto_recover: bool,
+    pub auto_record_via_host: bool,
     pub analysis_timeout_secs: f64,
 }
 
@@ -99,6 +100,7 @@ impl Default for Config {
             reconnect_secs: 2.0,
             prevent_sleep: true,
             auto_recover: true,
+            auto_record_via_host: false,
             analysis_timeout_secs: 10.0,
         }
     }

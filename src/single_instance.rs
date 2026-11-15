@@ -13,14 +13,17 @@ pub struct SingleInstance {
 
 /// Become the primary GUI, or notify the existing primary and return `None`.
 /// No lock file survives normal or abnormal process termination.
-pub fn acquire_or_notify() -> Result<Option<SingleInstance>> {
+pub fn acquire_or_notify(notify: bool) -> Result<Option<SingleInstance>> {
     #[cfg(windows)]
     {
-        platform::acquire("Local\\TalkRecorder.Gui.v1")
+        platform::acquire("Local\\TalkRecorder.Gui.v1", notify)
             .map(|instance| instance.map(|inner| SingleInstance { inner }))
     }
     #[cfg(not(windows))]
-    anyhow::bail!("GUIの多重起動制御はWindowsのみ対応しています")
+    {
+        let _ = notify;
+        anyhow::bail!("GUIの多重起動制御はWindowsのみ対応しています")
+    }
 }
 
 impl SingleInstance {
@@ -101,7 +104,7 @@ mod platform {
         value.encode_utf16().chain(Some(0)).collect()
     }
 
-    pub(super) fn acquire(prefix: &str) -> Result<Option<Instance>> {
+    pub(super) fn acquire(prefix: &str, notify: bool) -> Result<Option<Instance>> {
         let activation_name = name(&format!("{prefix}.Activate"));
         // Open/create the auto-reset event before the mutex. A second launch
         // can now signal immediately, even while the primary is initializing.
@@ -116,7 +119,10 @@ mod platform {
         let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
         let mutex = Handle(mutex.context("アプリの起動制限を準備できません")?);
         if already_exists {
-            unsafe { SetEvent(activation.0) }.context("既存の設定画面へ表示を要求できません")?;
+            if notify {
+                unsafe { SetEvent(activation.0) }
+                    .context("既存の設定画面へ表示を要求できません")?;
+            }
             return Ok(None);
         }
         let stop = Arc::new(Handle(
@@ -259,8 +265,8 @@ mod tests {
     #[test]
     fn early_activation_is_kept_until_waker_is_installed() {
         let prefix = unique_prefix();
-        let mut primary = platform::acquire(&prefix).unwrap().unwrap();
-        assert!(platform::acquire(&prefix).unwrap().is_none());
+        let mut primary = platform::acquire(&prefix, true).unwrap().unwrap();
+        assert!(platform::acquire(&prefix, true).unwrap().is_none());
         // Wait until the watcher has consumed the OS signal before attaching
         // the UI. set_waker must still repaint for this already-pending request.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -276,14 +282,14 @@ mod tests {
         assert!(primary.take_activation_request());
         assert!(!primary.take_activation_request());
         drop(primary);
-        assert!(platform::acquire(&prefix).unwrap().is_some());
+        assert!(platform::acquire(&prefix, true).unwrap().is_some());
     }
 
     #[test]
     fn separate_process_is_forwarded_and_wakes_primary() {
         let prefix = unique_prefix();
         let dir = tempfile::tempdir().unwrap();
-        let mut primary = platform::acquire(&prefix).unwrap().unwrap();
+        let mut primary = platform::acquire(&prefix, true).unwrap().unwrap();
         let (sender, receiver) = mpsc::channel();
         primary.set_waker(move || {
             let _ = sender.send(());
@@ -298,7 +304,7 @@ mod tests {
         receiver.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(primary.take_activation_request());
         drop(primary);
-        assert!(platform::acquire(&prefix).unwrap().is_some());
+        assert!(platform::acquire(&prefix, true).unwrap().is_some());
     }
 
     #[test]
@@ -333,7 +339,7 @@ mod tests {
             wait_until(|| child.0.try_wait().unwrap().is_some());
             assert!(child.0.wait().unwrap().success());
         }
-        assert!(platform::acquire(&prefix).unwrap().is_some());
+        assert!(platform::acquire(&prefix, true).unwrap().is_some());
     }
 
     #[test]
@@ -342,10 +348,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut primary = child(&prefix, "primary", dir.path());
         wait_until(|| dir.path().join("ready").is_file());
-        assert!(platform::acquire(&prefix).unwrap().is_none());
+        assert!(platform::acquire(&prefix, true).unwrap().is_none());
         primary.0.kill().unwrap();
         primary.0.wait().unwrap();
-        assert!(platform::acquire(&prefix).unwrap().is_some());
+        assert!(platform::acquire(&prefix, true).unwrap().is_some());
     }
 
     #[test]
@@ -354,7 +360,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut primary = child(&prefix, "primary", dir.path());
         wait_until(|| dir.path().join("ready").is_file());
-        assert!(platform::acquire(&prefix).unwrap().is_none());
+        assert!(platform::acquire(&prefix, true).unwrap().is_none());
         primary
             .0
             .stdin
@@ -364,7 +370,7 @@ mod tests {
             .unwrap();
         wait_until(|| primary.0.try_wait().unwrap().is_some());
         assert!(primary.0.wait().unwrap().success());
-        assert!(platform::acquire(&prefix).unwrap().is_some());
+        assert!(platform::acquire(&prefix, true).unwrap().is_some());
     }
 
     #[test]
@@ -378,7 +384,7 @@ mod tests {
         if mode.starts_with("compete-") {
             fs::write(dir.join(format!("ready-{mode}")), "ready").unwrap();
             wait_until(|| dir.join("go").is_file());
-            let instance = platform::acquire(&prefix).unwrap();
+            let instance = platform::acquire(&prefix, true).unwrap();
             fs::write(
                 dir.join(format!("result-{mode}")),
                 if instance.is_some() {
@@ -394,7 +400,7 @@ mod tests {
             drop(instance);
             return;
         }
-        let instance = platform::acquire(&prefix).unwrap();
+        let instance = platform::acquire(&prefix, true).unwrap();
         if mode == "secondary" {
             assert!(instance.is_none());
             fs::write(dir.join("result"), "forwarded").unwrap();

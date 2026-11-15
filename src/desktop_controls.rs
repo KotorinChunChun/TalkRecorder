@@ -1,5 +1,7 @@
 use eframe::egui;
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(windows)]
+use std::sync::{Arc, atomic::AtomicBool};
 use tray_icon::{
     MouseButton, TrayIconEvent,
     menu::{MenuEvent, MenuId},
@@ -16,24 +18,44 @@ pub(crate) struct DesktopRequests {
     pending: AtomicU8,
     #[cfg(windows)]
     window: usize,
+    #[cfg(windows)]
+    keep_hidden: Arc<AtomicBool>,
 }
 
 impl DesktopRequests {
-    pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> anyhow::Result<Self> {
+    pub(crate) fn new(cc: &eframe::CreationContext<'_>, hidden: bool) -> anyhow::Result<Self> {
         #[cfg(windows)]
         {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             let RawWindowHandle::Win32(handle) = cc.window_handle()?.as_raw() else {
                 anyhow::bail!("設定画面のWindowsハンドルを取得できません");
             };
-            Ok(Self {
+            let requests = Self {
                 window: handle.hwnd.get() as usize,
                 ..Self::default()
-            })
+            };
+            if hidden {
+                requests.keep_hidden.store(true, Ordering::Release);
+                let state = Arc::into_raw(requests.keep_hidden.clone());
+                // eframe の初回描画は Visible(false) に関わらず表示を要求する。
+                let installed = unsafe {
+                    windows_sys::Win32::UI::Shell::SetWindowSubclass(
+                        requests.window as _,
+                        Some(startup_visibility),
+                        1,
+                        state as usize,
+                    )
+                };
+                if installed == 0 {
+                    unsafe { drop(Arc::from_raw(state)) };
+                    anyhow::bail!("起動時のウィンドウ非表示を準備できません");
+                }
+            }
+            Ok(requests)
         }
         #[cfg(not(windows))]
         {
-            let _ = cc;
+            let _ = (cc, hidden);
             Ok(Self::default())
         }
     }
@@ -44,6 +66,7 @@ impl DesktopRequests {
         // 非表示ウィンドウでは描画が止まるため、updateより先に表示を要求する。
         #[cfg(windows)]
         if self.window != 0 {
+            self.keep_hidden.store(false, Ordering::Release);
             use windows::Win32::{
                 Foundation::HWND,
                 UI::WindowsAndMessaging::{IsIconic, SW_RESTORE, SW_SHOW, ShowWindowAsync},
@@ -74,6 +97,40 @@ impl DesktopRequests {
             _ => None,
         }
     }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn startup_visibility(
+    window: windows_sys::Win32::Foundation::HWND,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    id: usize,
+    data: usize,
+) -> isize {
+    use windows_sys::Win32::UI::{
+        Shell::{DefSubclassProc, RemoveWindowSubclass},
+        WindowsAndMessaging::{
+            GWL_STYLE, STYLESTRUCT, SWP_NOACTIVATE, SWP_SHOWWINDOW, WINDOWPOS, WM_NCDESTROY,
+            WM_STYLECHANGING, WM_WINDOWPOSCHANGING, WS_VISIBLE,
+        },
+    };
+    let state = data as *const AtomicBool;
+    if message == WM_NCDESTROY {
+        unsafe { RemoveWindowSubclass(window, Some(startup_visibility), id) };
+        unsafe { drop(Arc::from_raw(state)) };
+    } else if lparam != 0 && unsafe { (*state).load(Ordering::Acquire) } {
+        if message == WM_WINDOWPOSCHANGING {
+            let position = unsafe { &mut *(lparam as *mut WINDOWPOS) };
+            if position.flags & SWP_SHOWWINDOW != 0 {
+                position.flags = (position.flags & !SWP_SHOWWINDOW) | SWP_NOACTIVATE;
+            }
+        } else if message == WM_STYLECHANGING && wparam as i32 == GWL_STYLE {
+            let style = unsafe { &mut *(lparam as *mut STYLESTRUCT) };
+            style.styleNew &= !WS_VISIBLE;
+        }
+    }
+    unsafe { DefSubclassProc(window, message, wparam, lparam) }
 }
 
 pub(crate) fn tray_action(event: &TrayIconEvent) -> Option<DesktopAction> {

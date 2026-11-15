@@ -28,13 +28,14 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
 };
 
-pub fn run(path: PathBuf) -> Result<()> {
-    let Some(instance) = acquire_or_notify()? else {
+pub fn run(path: PathBuf, startup: bool, origin: &'static str) -> Result<()> {
+    let Some(instance) = acquire_or_notify(!startup)? else {
         return Ok(());
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("設定 - TalkRecorder - v{APP_VERSION}"))
+            .with_visible(!startup)
             .with_inner_size([960., 760.])
             .with_min_inner_size([800., 600.]),
         ..Default::default()
@@ -42,7 +43,7 @@ pub fn run(path: PathBuf) -> Result<()> {
     eframe::run_native(
         "TalkRecorder",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, path, instance)?))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, path, instance, startup, origin)?))),
     )
     .map_err(|e| anyhow::anyhow!("画面を起動できません: {e}"))
 }
@@ -69,12 +70,18 @@ struct App {
     recovery: Option<Receiver<Result<MaintenanceReport>>>,
     stop_after_secs: Option<f64>,
     mic_reference_test: bool,
+    #[cfg(windows)]
+    recording_status: Arc<crate::management::RecordingStatus>,
+    #[cfg(windows)]
+    _management: Option<crate::management::Management>,
 }
 impl App {
     fn new(
         cc: &eframe::CreationContext<'_>,
         path: PathBuf,
         mut instance: SingleInstance,
+        startup: bool,
+        origin: &'static str,
     ) -> Result<Self> {
         let mut fonts = egui::FontDefinitions::default();
         for font in [
@@ -116,7 +123,7 @@ impl App {
                 vec![]
             }
         };
-        let desktop_requests = Arc::new(DesktopRequests::new(cc)?);
+        let desktop_requests = Arc::new(DesktopRequests::new(cc, startup)?);
         let ctx = cc.egui_ctx.clone();
         let requests = desktop_requests.clone();
         instance.set_waker(move || requests.send(&ctx, DesktopAction::Show))?;
@@ -180,7 +187,18 @@ impl App {
             .windows(2)
             .find(|p| p[0] == "--ui-smoke")
             .map(|p| PathBuf::from(&p[1]));
-        let recovery = if (config.auto_recover || config.auto_compact_wav) && smoke_dir.is_none() {
+        if startup && tray.is_none() {
+            anyhow::bail!("無表示起動には通知領域の準備が必要です: {message}");
+        }
+        let auto_record = startup
+            && origin == "via_kotorintoys"
+            && allow_automatic
+            && config.auto_record_via_host
+            && smoke_dir.is_none();
+        let recovery = if !auto_record
+            && (config.auto_recover || config.auto_compact_wav)
+            && smoke_dir.is_none()
+        {
             let (sender, receiver) = mpsc::sync_channel(1);
             let maintenance_config = config.clone();
             let ctx = cc.egui_ctx.clone();
@@ -213,7 +231,29 @@ impl App {
         } else {
             None
         };
-        Ok(Self {
+        #[cfg(windows)]
+        let recording_status = Arc::new(crate::management::RecordingStatus::default());
+        #[cfg(windows)]
+        let management = {
+            let show = desktop_requests.clone();
+            let show_ctx = cc.egui_ctx.clone();
+            let stop = desktop_requests.clone();
+            let stop_ctx = cc.egui_ctx.clone();
+            match crate::management::Management::start(
+                origin,
+                recording_status.clone(),
+                move || show.send(&show_ctx, DesktopAction::Show),
+                move || stop.send(&stop_ctx, DesktopAction::Exit),
+            ) {
+                Ok(management) => Some(management),
+                Err(error) if startup => return Err(error),
+                Err(error) => {
+                    message.push_str(&format!("\n管理窓口を開けません: {error:#}"));
+                    None
+                }
+            }
+        };
+        let mut app = Self {
             config,
             device_settings,
             device_save_error: None,
@@ -225,7 +265,7 @@ impl App {
             page: 0,
             tray,
             tray_monitor,
-            hidden: false,
+            hidden: startup,
             exit: false,
             folder_picker: None,
             desktop_requests,
@@ -239,7 +279,16 @@ impl App {
                 .find(|pair| pair[0] == "--stop-after-secs")
                 .and_then(|pair| pair[1].parse::<f64>().ok()),
             mic_reference_test: std::env::args().any(|arg| arg == "--mic-reference-test"),
-        })
+            #[cfg(windows)]
+            recording_status,
+            #[cfg(windows)]
+            _management: management,
+        };
+        if auto_record {
+            // Recorder の準備処理が録音開始前に既存データの復旧を行う。
+            app.start(false);
+        }
+        Ok(app)
     }
     fn start(&mut self, preview: bool) {
         if self.exit || self.recorder.is_some() || self.recovery.is_some() {
@@ -248,6 +297,8 @@ impl App {
         self.remember_devices();
         match Recorder::start(self.config.clone(), preview) {
             Ok(r) => {
+                #[cfg(windows)]
+                self.recording_status.watch(r.phase_reader());
                 if let Some(monitor) = &self.tray_monitor {
                     let phase = r.phase_reader();
                     monitor.watch(move || tray_state(phase()));
@@ -256,6 +307,8 @@ impl App {
                 self.message.clear();
             }
             Err(e) => {
+                #[cfg(windows)]
+                self.recording_status.watch(|| RecorderPhase::Failed);
                 if let Some(monitor) = &self.tray_monitor {
                     monitor.set_state(TrayState::Failed);
                 }
@@ -476,6 +529,9 @@ impl App {
                 ui.end_row();
                 ui.label("起動時自動復旧");
                 ui.checkbox(&mut self.config.auto_recover, "有効");
+                ui.end_row();
+                ui.label("KotorinToys 経由の自動録音");
+                ui.checkbox(&mut self.config.auto_record_via_host, "有効");
                 ui.end_row();
             });
     }
