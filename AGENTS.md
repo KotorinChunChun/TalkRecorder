@@ -1,6 +1,6 @@
 # TalkRecorder 開発ルール
 
-KotorinToys 配下で作業する場合は上位の AGENTS.md を適用する。フォルダー名、製品名、実行ファイル名は TalkRecorder。現在版は v0.1.1。
+KotorinToys 配下で作業する場合は上位の AGENTS.md を適用する。フォルダー名、製品名、実行ファイル名は TalkRecorder。初回公開版は v0.1.0。
 
 ## 基本動作
 

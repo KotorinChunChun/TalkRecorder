@@ -8,7 +8,9 @@ if (Get-Process TalkRecorder -ErrorAction SilentlyContinue) {
     throw 'TalkRecorder が既に起動しています。検証は別のセッションで行ってください。'
 }
 $root = Split-Path $PSScriptRoot
-$run = Join-Path $root ('dev/history/v0.1.1/logs/managed-' + [guid]::NewGuid().ToString('N'))
+$version = (Get-Item -LiteralPath $exePath).VersionInfo.FileVersion
+if ($version -notmatch '^\d+\.\d+\.\d+$') { throw '実行ファイルの版を確認できません' }
+$run = Join-Path $root ("dev/history/v$version/logs/managed-" + [guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($run) | Out-Null
 $cfg = Join-Path $run 'settings.json'
 $writer = Start-Process -FilePath $exePath -ArgumentList @('--write-default-config','--config',('"' + $cfg + '"')) -WindowStyle Hidden -Wait -PassThru
@@ -76,7 +78,7 @@ try {
         try { $status = Send-Management status } catch [TimeoutException] { }
     } while ($null -eq $status -and [DateTime]::UtcNow -lt $deadline -and !$app.HasExited)
     if ($null -eq $status -or !$status.ready -or $status.protocolVersion -ne 2 -or $status.pid -ne $app.Id -or
-        $status.launchOrigin -ne 'via_kotorintoys' -or $status.detail -ne '待機中') {
+        $status.version -ne $version -or $status.launchOrigin -ne 'via_kotorintoys' -or $status.detail -ne '待機中') {
         throw '無表示起動後の状態が一致しません'
     }
     Start-Sleep -Milliseconds 800
