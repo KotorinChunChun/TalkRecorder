@@ -1,0 +1,28 @@
+[package]
+name = "talkrecorder-rnnoise-plugin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "BSD-3-Clause"
+publish = false
+
+[workspace]
+
+[lib]
+name = "talkrecorder_rnnoise"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nnnoiseless = { version = "=0.5.2", default-features = false }
+serde_json = "=1.0.154"
+
+[profile.release]
+strip = true
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

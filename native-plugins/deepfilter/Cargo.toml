@@ -1,0 +1,43 @@
+[package]
+name = "talkrecorder-deepfilter-plugin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[lib]
+name = "talkrecorder_deepfilter"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "7b14b895fe7fc42cab72b4a4c1e49c982bd6404b", default-features = false, features = ["tract"] }
+ndarray = "=0.15.6"
+serde_json = "1"
+# Upstream targets tract 0.21.4. Later 0.21 releases changed ndarray and Graph APIs.
+tract-core = "=0.21.4"
+tract-data = "=0.21.4"
+tract-hir = "=0.21.4"
+tract-linalg = "=0.21.4"
+tract-nnef = "=0.21.4"
+tract-onnx = "=0.21.4"
+tract-onnx-opl = "=0.21.4"
+tract-pulse = "=0.21.4"
+tract-pulse-opl = "=0.21.4"
+
+[dev-dependencies]
+hound = "=3.5.1"
+libloading = "0.8"
+
+[profile.release]
+strip = true
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

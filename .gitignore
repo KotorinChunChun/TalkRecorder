@@ -1,0 +1,45 @@
+# ビルド・配布物・音声ランタイム
+target/
+/release/
+/runtime/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.gguf
+*.onnx
+
+# 録音・設定・引き継ぎ・試験の生成結果
+/recordings/
+/local/
+/.agents/
+/.codex/
+/dev/handover/
+/dev/history/*/logs/
+*.log
+*.partial
+*.wav
+*.m4a
+*.aac
+*.opus
+*.flac
+*.mp3
+*.zip
+*.7z
+
+# 認証情報・個人用の環境設定
+.env
+.env.*
+secrets.json
+settings.local.json
+*.pfx
+*.p12
+*.key
+*.pem
+
+# エディター・OS
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+.DS_Store

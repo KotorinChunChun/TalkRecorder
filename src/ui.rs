@@ -1,0 +1,941 @@
+use crate::{
+    APP_VERSION, SpeechState,
+    capture::{self, DeviceInfo},
+    clock_sync::ClockMode,
+    config::{Config, OutputFormat, TrackSettings},
+    denoise_plugins::{PluginCatalog, discover_for_current_exe},
+    desktop_controls::{DesktopAction, DesktopRequests, menu_action, tray_action},
+    device_settings::DeviceSettingsStore,
+    engine::{Recorder, RecorderPhase},
+    maintenance::{self, MaintenanceReport},
+    single_instance::{SingleInstance, acquire_or_notify},
+    speech::DenoiseMode,
+    tray_status::{TrayMonitor, TrayState},
+};
+use anyhow::Result;
+use eframe::egui::{self, Color32, RichText, Stroke};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    time::Duration,
+};
+use tray_icon::{
+    TrayIcon, TrayIconBuilder, TrayIconEvent,
+    menu::{Menu, MenuEvent, MenuItem},
+};
+
+pub fn run(path: PathBuf) -> Result<()> {
+    let Some(instance) = acquire_or_notify()? else {
+        return Ok(());
+    };
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(format!("設定 - TalkRecorder - v{APP_VERSION}"))
+            .with_inner_size([960., 760.])
+            .with_min_inner_size([800., 600.]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "TalkRecorder",
+        options,
+        Box::new(move |cc| Ok(Box::new(App::new(cc, path, instance)?))),
+    )
+    .map_err(|e| anyhow::anyhow!("画面を起動できません: {e}"))
+}
+
+struct App {
+    config: Config,
+    device_settings: DeviceSettingsStore,
+    device_save_error: Option<String>,
+    path: PathBuf,
+    devices: Vec<DeviceInfo>,
+    plugins: PluginCatalog,
+    recorder: Option<Recorder>,
+    message: String,
+    page: usize,
+    tray: Option<TrayIcon>,
+    tray_monitor: Option<TrayMonitor>,
+    hidden: bool,
+    exit: bool,
+    folder_picker: Option<PathBuf>,
+    desktop_requests: Arc<DesktopRequests>,
+    instance: SingleInstance,
+    smoke_dir: Option<PathBuf>,
+    smoke_frames: u32,
+    recovery: Option<Receiver<Result<MaintenanceReport>>>,
+    stop_after_secs: Option<f64>,
+    mic_reference_test: bool,
+}
+impl App {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        path: PathBuf,
+        mut instance: SingleInstance,
+    ) -> Result<Self> {
+        let mut fonts = egui::FontDefinitions::default();
+        for font in [
+            "C:/Windows/Fonts/YuGothM.ttc",
+            "C:/Windows/Fonts/meiryo.ttc",
+        ] {
+            if let Ok(data) = std::fs::read(font) {
+                fonts
+                    .font_data
+                    .insert("japanese".into(), egui::FontData::from_owned(data).into());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "japanese".into());
+                break;
+            }
+        }
+        cc.egui_ctx.set_fonts(fonts);
+        let mut style = (*cc.egui_ctx.style()).clone();
+        for size in style.text_styles.values_mut() {
+            size.size = size.size.max(16.);
+        }
+        style.spacing.item_spacing = egui::vec2(6., 5.);
+        cc.egui_ctx.set_style(style);
+        let (config, mut message, allow_automatic) = match Config::load(&path) {
+            Ok(c) => (c, String::new(), true),
+            Err(e) => (
+                Config::default(),
+                format!("設定の読み込みに失敗: {e:#}"),
+                false,
+            ),
+        };
+        let device_settings = DeviceSettingsStore::new(&config, allow_automatic);
+        let devices = match capture::enumerate_devices() {
+            Ok(d) => d,
+            Err(e) => {
+                message = format!("デバイスを取得できません: {e:#}");
+                vec![]
+            }
+        };
+        let desktop_requests = Arc::new(DesktopRequests::new(cc)?);
+        let ctx = cc.egui_ctx.clone();
+        let requests = desktop_requests.clone();
+        instance.set_waker(move || requests.send(&ctx, DesktopAction::Show))?;
+        let menu = Menu::new();
+        let show_item = MenuItem::with_id("talkrecorder-show", "設定を開く", true, None);
+        let exit_item = MenuItem::with_id("talkrecorder-exit", "終了", true, None);
+        let tray_result = (|| -> Result<TrayIcon> {
+            menu.append_items(&[&show_item, &exit_item])?;
+            let icon = TrayState::Idle.icon()?;
+            Ok(TrayIconBuilder::new()
+                .with_icon(icon)
+                .with_menu(Box::new(menu))
+                .with_menu_on_left_click(false)
+                .with_menu_on_right_click(true)
+                .with_tooltip(TrayState::Idle.tooltip())
+                .build()?)
+        })();
+        let mut tray = match tray_result {
+            Ok(tray) => Some(tray),
+            Err(error) => {
+                message = format!("通知領域を作成できません: {error:#}");
+                None
+            }
+        };
+        let tray_monitor = match tray
+            .as_ref()
+            .map(|tray| TrayMonitor::new(tray.clone()))
+            .transpose()
+        {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                tray.take();
+                if !message.is_empty() {
+                    message.push('\n');
+                }
+                message.push_str(&format!("通知領域の状態監視を開始できません: {error:#}"));
+                None
+            }
+        };
+        let ctx = cc.egui_ctx.clone();
+        let requests = desktop_requests.clone();
+        let tray_id = tray.as_ref().map(|tray| tray.id().clone());
+        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+            if tray_id.as_ref() == Some(event.id())
+                && let Some(action) = tray_action(&event)
+            {
+                requests.send(&ctx, action);
+            }
+        }));
+        let ctx = cc.egui_ctx.clone();
+        let requests = desktop_requests.clone();
+        let show_id = show_item.id().clone();
+        let exit_id = exit_item.id().clone();
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            if let Some(action) = menu_action(&event, &show_id, &exit_id) {
+                requests.send(&ctx, action);
+            }
+        }));
+        let smoke_dir = std::env::args()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find(|p| p[0] == "--ui-smoke")
+            .map(|p| PathBuf::from(&p[1]));
+        let recovery = if (config.auto_recover || config.auto_compact_wav) && smoke_dir.is_none() {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let maintenance_config = config.clone();
+            let ctx = cc.egui_ctx.clone();
+            let completion = Arc::new(AtomicU8::new(0));
+            if let Some(monitor) = &tray_monitor {
+                let state = completion.clone();
+                monitor.watch(move || match state.load(Ordering::Acquire) {
+                    0 => TrayState::Recovering,
+                    1 => TrayState::Idle,
+                    _ => TrayState::Failed,
+                });
+            }
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    maintenance::run(&maintenance_config, true)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "復旧・圧縮スレッドが異常終了しました。元データを保持しています"
+                    ))
+                });
+                let successful = result
+                    .as_ref()
+                    .is_ok_and(|report| report.errors().next().is_none());
+                completion.store(if successful { 1 } else { 2 }, Ordering::Release);
+                let _ = sender.send(result);
+                ctx.request_repaint();
+            });
+            Some(receiver)
+        } else {
+            None
+        };
+        Ok(Self {
+            config,
+            device_settings,
+            device_save_error: None,
+            path,
+            devices,
+            plugins: discover_for_current_exe(),
+            recorder: None,
+            message,
+            page: 0,
+            tray,
+            tray_monitor,
+            hidden: false,
+            exit: false,
+            folder_picker: None,
+            desktop_requests,
+            instance,
+            smoke_dir,
+            smoke_frames: 0,
+            recovery,
+            stop_after_secs: std::env::args()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find(|pair| pair[0] == "--stop-after-secs")
+                .and_then(|pair| pair[1].parse::<f64>().ok()),
+            mic_reference_test: std::env::args().any(|arg| arg == "--mic-reference-test"),
+        })
+    }
+    fn start(&mut self, preview: bool) {
+        if self.exit || self.recorder.is_some() || self.recovery.is_some() {
+            return;
+        }
+        self.remember_devices();
+        match Recorder::start(self.config.clone(), preview) {
+            Ok(r) => {
+                if let Some(monitor) = &self.tray_monitor {
+                    let phase = r.phase_reader();
+                    monitor.watch(move || tray_state(phase()));
+                }
+                self.recorder = Some(r);
+                self.message.clear();
+            }
+            Err(e) => {
+                if let Some(monitor) = &self.tray_monitor {
+                    monitor.set_state(TrayState::Failed);
+                }
+                self.message = format!("{e:#}");
+            }
+        }
+    }
+    fn remember_devices(&mut self) {
+        refresh_device_names(&mut self.config, &self.devices);
+        match self.device_settings.remember(&self.path, &self.config) {
+            Ok(true) => self.device_save_error = None,
+            Ok(false) => {}
+            Err(error) => {
+                self.device_save_error =
+                    Some(format!("デバイス設定を自動保存できません: {error:#}"))
+            }
+        }
+    }
+    fn request_exit(&mut self) {
+        if !self.exit {
+            self.exit = true;
+            self.hidden = false;
+            if let Some(recorder) = &self.recorder {
+                recorder.stop();
+            }
+            if self.recovery.is_some() {
+                self.message = "終了準備中：復旧・圧縮の完了を待っています".into();
+            }
+        }
+    }
+    fn devices(&mut self, ui: &mut egui::Ui) {
+        let status = self.recorder.as_ref().map(Recorder::status);
+        let can_edit = !self.exit && self.recorder.is_none() && self.recovery.is_none();
+        for (index, track) in self.config.tracks.iter_mut().enumerate() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        can_edit,
+                        egui::Checkbox::new(&mut track.enabled, &track.label),
+                    );
+                    let name = device_display_name(track, &self.devices);
+                    ui.add_enabled_ui(can_edit, |ui| {
+                        egui::ComboBox::from_id_salt(("device", index))
+                            .selected_text(name)
+                            .width(380.)
+                            .show_ui(ui, |ui| {
+                                for device in self.devices.iter().filter(|d| d.kind == track.kind) {
+                                    ui.selectable_value(
+                                        &mut track.device_id,
+                                        device.id.clone(),
+                                        &device.name,
+                                    );
+                                }
+                            });
+                        egui::ComboBox::from_id_salt(("denoise", index))
+                            .selected_text(denoise_name(&track.denoise, &self.plugins))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut track.denoise, DenoiseMode::Off, "ノイズ除去なし");
+                                for plugin in &self.plugins.available {
+                                    ui.selectable_value(
+                                        &mut track.denoise,
+                                        DenoiseMode::Plugin(plugin.id.clone()),
+                                        &plugin.name,
+                                    );
+                                }
+                            });
+                    });
+                    let state = status
+                        .as_ref()
+                        .and_then(|s| s.speech.get(index))
+                        .copied()
+                        .unwrap_or(SpeechState::Unknown);
+                    ui.label(match state {
+                        SpeechState::Speech => "発話",
+                        SpeechState::Silence => "非発話",
+                        SpeechState::Unknown => "未判定",
+                    });
+                    if let Some(timing) = status.as_ref().and_then(|s| s.timing.get(index)).copied().flatten() {
+                        match timing.mode {
+                            ClockMode::Native => {},
+                            ClockMode::Learning => { ui.label("時計を補正中"); },
+                            ClockMode::Recovered => { ui.label("時計補正済み").on_hover_text(format!("推定のばらつき {:.0}ms。機器間の固定遅延は共通音声で別に測定します。", timing.uncertainty_ms)); },
+                            ClockMode::Unstable => { ui.label("時刻不安定・音声保持"); },
+                        }
+                    }
+                });
+                let wave = status
+                    .as_ref()
+                    .and_then(|s| s.waves.get(index))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 75.),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 3., Color32::from_rgb(20, 29, 39));
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left(), rect.center().y),
+                        egui::pos2(rect.right(), rect.center().y),
+                    ],
+                    Stroke::new(1.0_f32, Color32::DARK_GRAY),
+                );
+                if wave.len() > 1 {
+                    let points: Vec<_> = wave
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &v)| {
+                            egui::pos2(
+                                rect.left() + rect.width() * i as f32 / (wave.len() - 1) as f32,
+                                rect.center().y - v.clamp(-1., 1.) * rect.height() * 0.45,
+                            )
+                        })
+                        .collect();
+                    painter.add(egui::Shape::line(
+                        points,
+                        Stroke::new(1.3_f32, Color32::from_rgb(65, 208, 168)),
+                    ));
+                }
+            });
+        }
+        if ui
+            .add_enabled(can_edit, egui::Button::new("デバイスを再取得"))
+            .clicked()
+        {
+            match capture::enumerate_devices() {
+                Ok(d) => self.devices = d,
+                Err(e) => self.message = format!("{e:#}"),
+            }
+        }
+        if ui
+            .add_enabled(can_edit, egui::Button::new("プラグインを再取得"))
+            .clicked()
+        {
+            self.plugins = discover_for_current_exe();
+            self.message = format!(
+                "利用できるノイズ除去プラグイン: {}件",
+                self.plugins.available.len()
+            );
+        }
+    }
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("storage-settings")
+            .num_columns(2)
+            .spacing([16., 10.])
+            .show(ui, |ui| {
+                ui.label("保存先");
+                ui.horizontal(|ui| {
+                    path_edit(ui, &mut self.config.output_dir);
+                    if ui.button("選択").clicked() {
+                        self.folder_picker =
+                            Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:/")));
+                    }
+                });
+                ui.end_row();
+                ui.label("保存形式");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.config.format, OutputFormat::M4a, "M4A / AAC");
+                    ui.selectable_value(&mut self.config.format, OutputFormat::Opus, "Opus");
+                    ui.selectable_value(&mut self.config.format, OutputFormat::Flac, "FLAC");
+                    ui.selectable_value(&mut self.config.format, OutputFormat::Wav, "WAV");
+                });
+                ui.end_row();
+                ui.label("WAV自動圧縮");
+                ui.checkbox(
+                    &mut self.config.auto_compact_wav,
+                    "新規はM4A保存・既存は変換後削除",
+                );
+                ui.end_row();
+                ui.label("FFmpeg");
+                path_edit(ui, &mut self.config.ffmpeg_path);
+                ui.end_row();
+                ui.label("停止する空き容量");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.stop_free_space_mb)
+                        .suffix(" MB")
+                        .range(0..=1_048_576),
+                )
+                .on_hover_text(
+                    "保存先の空き容量がこの値以下になると録音を停止します。0は無効です。",
+                );
+                ui.end_row();
+                seconds(ui, "分割基準", &mut self.config.timing.segment_secs);
+                seconds(
+                    ui,
+                    "分割用の共通非発話",
+                    &mut self.config.timing.split_silence_secs,
+                );
+                seconds(
+                    ui,
+                    "非発話を残す長さ",
+                    &mut self.config.timing.keep_silence_secs,
+                );
+                seconds(
+                    ui,
+                    "会話なし除外の判定",
+                    &mut self.config.timing.discard_silence_secs,
+                );
+                seconds(ui, "処理待ちの上限", &mut self.config.max_pending_secs);
+                seconds(ui, "内部確定間隔", &mut self.config.checkpoint_secs);
+                seconds(ui, "再接続間隔", &mut self.config.reconnect_secs);
+                seconds(
+                    ui,
+                    "音声解析の応答期限",
+                    &mut self.config.analysis_timeout_secs,
+                );
+                seconds(ui, "波形表示の時間", &mut self.config.preview_secs);
+                ui.label("未処理音声の上限");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.spool_limit_mb)
+                        .suffix(" MB")
+                        .range(16..=1_048_576),
+                );
+                ui.end_row();
+                ui.label("自動スリープ抑止");
+                ui.checkbox(&mut self.config.prevent_sleep, "録音中に有効");
+                ui.end_row();
+                ui.label("起動時自動復旧");
+                ui.checkbox(&mut self.config.auto_recover, "有効");
+                ui.end_row();
+            });
+    }
+    fn speech_settings(&mut self, ui: &mut egui::Ui) {
+        let s = &mut self.config.speech;
+        egui::Grid::new("speech-settings")
+            .num_columns(2)
+            .spacing([16., 10.])
+            .show(ui, |ui| {
+                ui.label("speech.cpp DLL");
+                path_edit(ui, &mut s.dll_path);
+                ui.end_row();
+                ui.label("Silero VAD");
+                path_edit(ui, &mut s.vad_model);
+                ui.end_row();
+                ui.label("発話しきい値");
+                ui.add(
+                    egui::DragValue::new(&mut s.vad_threshold)
+                        .speed(0.01)
+                        .range(0.01..=0.99),
+                );
+                ui.end_row();
+                seconds(ui, "発話前の余裕", &mut s.pad_before_secs);
+                seconds(ui, "発話後の余裕", &mut s.pad_after_secs);
+                seconds(ui, "最小発話長", &mut s.min_speech_secs);
+                ui.label("Haas 補助認識");
+                ui.checkbox(&mut s.haas_enabled, "有効");
+                ui.end_row();
+                ui.label("Haas モデル");
+                path_edit(ui, &mut s.haas_model);
+                ui.end_row();
+                seconds(ui, "RE-USEの処理単位", &mut s.chunk_secs);
+            });
+        ui.collapsing("ノイズ除去プラグインの確認", |ui| {
+            ui.label(format!("利用可能: {}件", self.plugins.available.len()));
+            for plugin in &self.plugins.available {
+                ui.label(&plugin.name);
+            }
+            for issue in &self.plugins.issues {
+                ui.label(issue);
+            }
+        });
+    }
+}
+fn seconds(ui: &mut egui::Ui, label: &str, value: &mut f64) {
+    ui.label(label);
+    ui.add(
+        egui::DragValue::new(value)
+            .speed(0.1)
+            .suffix(" 秒")
+            .range(0.0..=604_800.0),
+    );
+    ui.end_row();
+}
+fn path_edit(ui: &mut egui::Ui, path: &mut PathBuf) {
+    let mut s = path.to_string_lossy().to_string();
+    if ui
+        .add(egui::TextEdit::singleline(&mut s).desired_width(530.))
+        .changed()
+    {
+        *path = s.into();
+    }
+}
+fn denoise_name(mode: &DenoiseMode, plugins: &PluginCatalog) -> String {
+    let Some(id) = mode.plugin_id() else {
+        return "ノイズ除去なし".into();
+    };
+    plugins
+        .available
+        .iter()
+        .find(|plugin| plugin.id == id)
+        .map(|plugin| plugin.name.clone())
+        .unwrap_or_else(|| format!("未配置: {id}"))
+}
+
+fn tray_state(phase: RecorderPhase) -> TrayState {
+    match phase {
+        RecorderPhase::Preparing => TrayState::Preparing,
+        RecorderPhase::Preview => TrayState::Preview,
+        RecorderPhase::Recording => TrayState::Recording,
+        RecorderPhase::Finalizing => TrayState::Finalizing,
+        RecorderPhase::Finished => TrayState::Idle,
+        RecorderPhase::Failed => TrayState::Failed,
+    }
+}
+
+fn device_display_name(track: &TrackSettings, devices: &[DeviceInfo]) -> String {
+    if track.device_id.is_empty() {
+        "未選択".into()
+    } else if let Some(device) = devices
+        .iter()
+        .find(|device| device.id == track.device_id && device.kind == track.kind)
+    {
+        device.name.clone()
+    } else {
+        format!(
+            "未接続: {}",
+            if track.device_name.is_empty() {
+                &track.device_id
+            } else {
+                &track.device_name
+            }
+        )
+    }
+}
+
+fn refresh_device_names(config: &mut Config, devices: &[DeviceInfo]) {
+    for track in &mut config.tracks {
+        if let Some(device) = devices
+            .iter()
+            .find(|device| device.id == track.device_id && device.kind == track.kind)
+        {
+            track.device_name.clone_from(&device.name);
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(error) = self.tray_monitor.as_ref().and_then(TrayMonitor::take_error) {
+            if !self.message.is_empty() {
+                self.message.push('\n');
+            }
+            self.message
+                .push_str(&format!("通知領域の更新に失敗: {error}"));
+        }
+        if let (Some(limit), Some(recorder)) = (self.stop_after_secs, &self.recorder)
+            && recorder.status().elapsed_secs >= limit
+        {
+            recorder.stop();
+        }
+        if let Some(result) =
+            self.recovery
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!(
+                        "復旧処理が応答せず終了しました。元データは保持しています"
+                    ))),
+                })
+        {
+            self.recovery = None;
+            let text = match result {
+                Ok(report) => report.message(),
+                Err(error) => format!("復旧処理を完了できませんでした: {error:#}"),
+            };
+            if self.message.is_empty() {
+                self.message = text;
+            } else {
+                self.message.push('\n');
+                self.message.push_str(&text);
+            }
+        }
+        if let Some(dir) = self.smoke_dir.clone() {
+            self.smoke_frames += 1;
+            if self.smoke_frames == 5 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+            }
+            for event in ctx.input(|i| i.events.clone()) {
+                if let egui::Event::Screenshot { image, .. } = event {
+                    let result = (|| -> Result<()> {
+                        std::fs::create_dir_all(&dir)?;
+                        let bytes: Vec<u8> =
+                            image.pixels.iter().flat_map(|p| p.to_array()).collect();
+                        image::save_buffer(
+                            dir.join(format!("settings-{}.png", self.page)),
+                            &bytes,
+                            image.width() as u32,
+                            image.height() as u32,
+                            image::ColorType::Rgba8,
+                        )?;
+                        Ok(())
+                    })();
+                    if let Err(e) = result {
+                        eprintln!("{e:#}");
+                        self.exit = true;
+                    } else if self.page < 2 {
+                        self.page += 1;
+                        self.smoke_frames = 0;
+                    } else {
+                        self.exit = true;
+                    }
+                }
+            }
+        }
+        let _ = self.instance.take_activation_request();
+        match self.desktop_requests.take() {
+            Some(DesktopAction::Exit) => self.request_exit(),
+            Some(DesktopAction::Show) if !self.exit => {
+                self.hidden = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            _ => {}
+        }
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if !self.exit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if self.tray.is_some() {
+                    self.hidden = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                } else {
+                    self.message = "通知領域を作成できません。終了ボタンを使ってください".into();
+                }
+            } else if self.recorder.is_some() || self.recovery.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+        }
+        if self.recorder.as_ref().is_some_and(Recorder::is_finished) {
+            let mut recorder = self.recorder.take().unwrap();
+            let status = recorder.status();
+            self.message = match recorder.join() {
+                Ok(()) => status.message,
+                Err(e) => format!("{e:#}"),
+            };
+        }
+        if self.exit && self.recorder.is_none() && self.recovery.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        egui::TopBottomPanel::top("actions").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("TalkRecorder").strong().size(20.));
+                if self.recorder.is_none() {
+                    if ui
+                        .add_enabled(
+                            !self.exit && self.recovery.is_none(),
+                            egui::Button::new(self.stop_after_secs.map_or_else(
+                                || "録音開始".to_owned(),
+                                |limit| format!("録音開始（{limit:.0}秒）"),
+                            )),
+                        )
+                        .clicked()
+                    {
+                        self.start(false);
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.exit && self.recovery.is_none(),
+                            egui::Button::new("入力確認"),
+                        )
+                        .clicked()
+                    {
+                        self.start(true);
+                    }
+                } else if ui.button("停止").clicked()
+                    && let Some(r) = &self.recorder
+                {
+                    r.stop();
+                }
+                if ui
+                    .add_enabled(
+                        !self.exit && self.recorder.is_none() && self.recovery.is_none(),
+                        egui::Button::new("設定を保存"),
+                    )
+                    .clicked()
+                {
+                    self.message = match self.config.save_atomic(&self.path) {
+                        Ok(()) => {
+                            self.device_settings.mark_saved(&self.config);
+                            self.device_save_error = None;
+                            "設定を保存しました".into()
+                        }
+                        Err(e) => format!("{e:#}"),
+                    };
+                }
+                if ui
+                    .add_enabled(
+                        !self.exit && self.tray.is_some(),
+                        egui::Button::new("トレイへ"),
+                    )
+                    .clicked()
+                {
+                    self.hidden = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+                if ui
+                    .add_enabled(!self.exit, egui::Button::new("終了"))
+                    .clicked()
+                {
+                    self.request_exit();
+                }
+            });
+            ui.horizontal(|ui| {
+                for (index, label) in ["デバイス", "保存・時間", "音声処理"].iter().enumerate()
+                {
+                    ui.selectable_value(&mut self.page, index, *label);
+                }
+            });
+            if self.mic_reference_test
+                && let Some(recorder) = &self.recorder
+            {
+                let seconds = recorder.status().elapsed_secs;
+                let prompt = if seconds < 10.0 {
+                    "静かにお待ちください（10秒から発話）"
+                } else if seconds < 20.0 {
+                    "話してください（1回目）"
+                } else if seconds < 45.0 {
+                    "静かにお待ちください"
+                } else if seconds < 55.0 {
+                    "話してください（2回目）"
+                } else if seconds < 74.0 {
+                    "静かにお待ちください（74秒で自動停止）"
+                } else {
+                    "録音を確定しています"
+                };
+                ui.label(RichText::new(prompt).strong().size(22.0));
+            }
+        });
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            if let Some(r) = &self.recorder {
+                let s = r.status();
+                ui.label(&s.message);
+                ui.label(format!(
+                    "{} {:.1} 秒　保存 {:.1} 秒　処理待ち {:.1} 秒",
+                    if s.phase == RecorderPhase::Preview {
+                        "入力確認"
+                    } else {
+                        "録音"
+                    },
+                    s.elapsed_secs,
+                    s.saved_secs,
+                    s.pending_secs
+                ));
+                if let Some(path) = s.folder {
+                    ui.label(path.display().to_string());
+                }
+            } else {
+                if self.recovery.is_some() {
+                    ui.label("未完了録音を確認中");
+                }
+                ui.label(if self.message.is_empty() {
+                    if self.recovery.is_some() {
+                        ""
+                    } else {
+                        "停止中"
+                    }
+                } else {
+                    &self.message
+                });
+            }
+            if let Some(error) = &self.device_save_error {
+                ui.colored_label(Color32::YELLOW, error);
+            }
+        });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| match self.page {
+                0 => self.devices(ui),
+                1 => {
+                    ui.add_enabled_ui(
+                        !self.exit && self.recorder.is_none() && self.recovery.is_none(),
+                        |ui| self.settings(ui),
+                    );
+                }
+                _ => {
+                    ui.add_enabled_ui(
+                        !self.exit && self.recorder.is_none() && self.recovery.is_none(),
+                        |ui| self.speech_settings(ui),
+                    );
+                }
+            });
+        });
+        if let Some(current) = self.folder_picker.clone() {
+            let mut open = true;
+            let mut chosen = false;
+            egui::Window::new("保存先を選択")
+                .open(&mut open)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label(current.display().to_string());
+                    ui.horizontal(|ui| {
+                        if ui.button("上へ").clicked()
+                            && let Some(p) = current.parent()
+                        {
+                            self.folder_picker = Some(p.into());
+                        }
+                        if ui.button("このフォルダーを選択").clicked() {
+                            self.config.output_dir = current.clone();
+                            chosen = true;
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(350.)
+                        .show(ui, |ui| {
+                            if let Ok(entries) = std::fs::read_dir(&current) {
+                                for entry in entries.filter_map(Result::ok) {
+                                    if entry.file_type().is_ok_and(|t| t.is_dir())
+                                        && ui.button(entry.file_name().to_string_lossy()).clicked()
+                                    {
+                                        self.folder_picker = Some(entry.path());
+                                    }
+                                }
+                            }
+                        });
+                });
+            if !open || chosen {
+                self.folder_picker = None;
+            }
+        }
+        self.remember_devices();
+        ctx.request_repaint_after(Duration::from_millis(if self.hidden { 500 } else { 100 }));
+    }
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(mut recorder) = self.recorder.take() {
+            recorder.stop();
+            let _ = recorder.join();
+        }
+        self.remember_devices();
+        self.tray_monitor.take();
+        self.tray.take();
+    }
+}
+
+pub fn config_path_default() -> PathBuf {
+    Path::new("local").join("settings.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remembered_missing_device_is_distinct_from_unselected_and_never_rebound_by_name() {
+        let mut config = Config::default();
+        let replacement = DeviceInfo {
+            id: "another-id".into(),
+            name: "同じ名前".into(),
+            kind: capture::DeviceKind::Microphone,
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let devices = vec![replacement];
+        assert_eq!(device_display_name(&config.tracks[0], &devices), "未選択");
+        config.tracks[0].device_id = "original-id".into();
+        config.tracks[0].device_name = "同じ名前".into();
+        refresh_device_names(&mut config, &devices);
+        assert_eq!(config.tracks[0].device_id, "original-id");
+        assert_eq!(
+            device_display_name(&config.tracks[0], &devices),
+            "未接続: 同じ名前"
+        );
+        let mut original = devices[0].clone();
+        original.id = "original-id".into();
+        original.name = "再接続したマイク".into();
+        refresh_device_names(&mut config, &[original.clone()]);
+        assert_eq!(config.tracks[0].device_name, original.name);
+        assert_eq!(
+            device_display_name(&config.tracks[0], &[original]),
+            "再接続したマイク"
+        );
+    }
+
+    #[test]
+    fn recording_indicator_excludes_preview_preparation_and_saved_completion() {
+        assert_eq!(tray_state(RecorderPhase::Recording), TrayState::Recording);
+        assert_eq!(tray_state(RecorderPhase::Preview), TrayState::Preview);
+        assert_eq!(tray_state(RecorderPhase::Finished), TrayState::Idle);
+        assert_eq!(tray_state(RecorderPhase::Failed), TrayState::Failed);
+        assert_eq!(tray_state(RecorderPhase::Preparing), TrayState::Preparing);
+        assert_eq!(tray_state(RecorderPhase::Finalizing), TrayState::Finalizing);
+    }
+}
