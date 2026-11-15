@@ -16,6 +16,7 @@ use std::{
 const MB: u64 = 1_048_576;
 const INTERVAL: Duration = Duration::from_secs(1);
 const TIMEOUT: Duration = Duration::from_secs(3);
+const RESIDENT_STALE_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct SpaceReading {
@@ -136,11 +137,18 @@ pub struct SpaceMonitor {
     seen: u64,
     limit_bytes: u64,
     timeout: Duration,
+    stale_timeout: Duration,
 }
 
 impl SpaceMonitor {
     pub fn start(path: &Path, limit_mb: u64) -> Result<Self> {
         Self::start_with_probe(path, limit_mb, INTERVAL, TIMEOUT, available_bytes)
+    }
+
+    pub(crate) fn start_resident(path: &Path, limit_mb: u64) -> Result<Self> {
+        let mut monitor = Self::start(path, limit_mb)?;
+        monitor.stale_timeout = RESIDENT_STALE_TIMEOUT;
+        Ok(monitor)
     }
 
     fn start_with_probe(
@@ -158,6 +166,7 @@ impl SpaceMonitor {
             seen: 0,
             limit_bytes,
             timeout,
+            stale_timeout: timeout,
         };
         if limit_bytes == 0 {
             return Ok(monitor);
@@ -286,9 +295,9 @@ impl SpaceMonitor {
 
     fn reading(&self, latest: &Measurement) -> Result<SpaceReading> {
         ensure!(
-            latest.completed.elapsed() < self.timeout,
+            latest.completed.elapsed() < self.stale_timeout,
             "空き容量の照会が{:.1}秒以上更新されていないため停止します",
-            self.timeout.as_secs_f64()
+            self.stale_timeout.as_secs_f64()
         );
         // 同じ失敗も無視しない。呼出側はエラーを停止の根拠にできる。
         let available_bytes = *latest

@@ -187,7 +187,8 @@ fn stopped_recording_keeps_buffered_audio(mode: StopMode, format: OutputFormat) 
         ),
     }
     assert_eq!(raw.frames, RATE);
-    assert!(requested.load(Ordering::Acquire));
+    assert!(session_stop.load(Ordering::Acquire));
+    assert!(!requested.load(Ordering::Acquire));
     assert!(!resume.detected, "容量停止をスリープ復帰として再開しません");
     assert!(capacity.readings.is_empty());
 

@@ -167,7 +167,15 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn start(mut config: Config, preview: bool) -> Result<Self> {
+    pub fn start(config: Config, preview: bool) -> Result<Self> {
+        Self::start_with_policy(config, preview, false)
+    }
+
+    pub(crate) fn start_resident(config: Config) -> Result<Self> {
+        Self::start_with_policy(config, false, true)
+    }
+
+    fn start_with_policy(mut config: Config, preview: bool, resident: bool) -> Result<Self> {
         if config.auto_compact_wav && config.format == OutputFormat::Wav {
             config.format = OutputFormat::M4a;
         }
@@ -204,14 +212,57 @@ impl Recorder {
         let thread_status = Arc::clone(&status);
         let handle = thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(
-                    config,
-                    preview,
-                    devices,
-                    slots,
-                    &thread_stop,
-                    &thread_status,
-                )
+                let mut retries = 0;
+                loop {
+                    let result = run(
+                        &config,
+                        preview,
+                        resident,
+                        &devices,
+                        &slots,
+                        &thread_stop,
+                        &thread_status,
+                    );
+                    let (probe_failed, elapsed) = {
+                        let status = thread_status.lock().unwrap_or_else(|e| e.into_inner());
+                        (
+                            matches!(
+                                status.capacity_stop,
+                                Some(CapacityStopReason::ProbeFailed { .. })
+                            ),
+                            status.elapsed_secs,
+                        )
+                    };
+                    if elapsed >= 30.0 {
+                        retries = 0;
+                    }
+                    if !resident
+                        || !probe_failed
+                        || result.is_ok()
+                        || retries >= 3
+                        || thread_stop.load(Ordering::Acquire)
+                    {
+                        break result;
+                    }
+                    retries += 1;
+                    update(&thread_status, |status| {
+                        status.phase = RecorderPhase::Preparing;
+                        status.message = "空き容量の再照会を待機中".into();
+                    });
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while std::time::Instant::now() < deadline {
+                        if thread_stop.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        thread::park_timeout(Duration::from_millis(100));
+                    }
+                    update(&thread_status, |status| {
+                        *status = Status {
+                            phase: RecorderPhase::Preparing,
+                            ..Status::default()
+                        };
+                    });
+                }
             }))
             .unwrap_or_else(|_| Err(anyhow!("録音管理スレッドが異常終了しました")));
             thread_stop.store(true, Ordering::Release);
@@ -417,26 +468,29 @@ struct BlockMetadata {
 }
 
 fn run(
-    config: Config,
+    config: &Config,
     preview: bool,
-    devices: Vec<DeviceInfo>,
-    slots: Vec<usize>,
+    resident: bool,
+    devices: &[DeviceInfo],
+    slots: &[usize],
     stop: &Arc<AtomicBool>,
     status: &SharedStatus,
 ) -> Result<()> {
-    let mut capacity = SpaceMonitor::start(
-        &config.output_dir,
-        if preview {
-            0
-        } else {
-            config.stop_free_space_mb
-        },
-    )?;
+    let limit = if preview {
+        0
+    } else {
+        config.stop_free_space_mb
+    };
+    let mut capacity = if resident {
+        SpaceMonitor::start_resident(&config.output_dir, limit)
+    } else {
+        SpaceMonitor::start(&config.output_dir, limit)
+    }?;
     if !preview {
         update(status, |s| {
             s.message = "録音の復旧・容量削減を確認中".into()
         });
-        let report = maintenance::run(&config, true)?;
+        let report = maintenance::run(config, true)?;
         update(status, |s| s.message = report.message());
     }
     let _sleep_guard = SleepGuard::new(config.prevent_sleep && !preview)?;
@@ -446,8 +500,8 @@ fn run(
             let attempt = run_session(
                 config.clone(),
                 preview,
-                devices.clone(),
-                slots.clone(),
+                devices.to_vec(),
+                slots.to_vec(),
                 stop,
                 status,
                 finalizer.client(),
@@ -477,7 +531,7 @@ fn run(
             .check_now()
             .is_ok_and(|reading| reading.is_none_or(|reading| !reading.is_low()));
     let maintenance = if allow_maintenance {
-        let report = maintenance::run(&config, false)?;
+        let report = maintenance::run(config, false)?;
         let errors: Vec<_> = report.errors().cloned().collect();
         if errors.is_empty() {
             Ok(())
@@ -545,7 +599,7 @@ fn run_session(
     if requested.load(Ordering::Acquire) {
         return Ok(false);
     }
-    if !preview && stop_for_capacity(capacity.check_now(), status, requested)? {
+    if !preview && stop_for_capacity(capacity.check_now(), status, stop)? {
         return Ok(false);
     }
     let (sender, receiver) = mpsc::sync_channel(1_024);
@@ -830,7 +884,7 @@ fn acquire(
         if resume.observe(source_frames(origin), detector.poll()) {
             break;
         }
-        match stop_for_capacity(capacity.poll(), status, requested) {
+        match stop_for_capacity(capacity.poll(), status, stop) {
             Ok(true) => break,
             Ok(false) => {}
             Err(error) => {

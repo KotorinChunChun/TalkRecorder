@@ -286,16 +286,25 @@ impl App {
         };
         if auto_record {
             // Recorder の準備処理が録音開始前に既存データの復旧を行う。
-            app.start(false);
+            app.start_recording(false, true);
         }
         Ok(app)
     }
     fn start(&mut self, preview: bool) {
+        self.start_recording(preview, false);
+    }
+
+    fn start_recording(&mut self, preview: bool, resident: bool) {
         if self.exit || self.recorder.is_some() || self.recovery.is_some() {
             return;
         }
         self.remember_devices();
-        match Recorder::start(self.config.clone(), preview) {
+        let recording = if resident {
+            Recorder::start_resident(self.config.clone())
+        } else {
+            Recorder::start(self.config.clone(), preview)
+        };
+        match recording {
             Ok(r) => {
                 #[cfg(windows)]
                 self.recording_status.watch(r.phase_reader());
