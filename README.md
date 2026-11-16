@@ -9,7 +9,9 @@ TalkRecorder は、Windows 11 でマイクとスピーカーの音を同時に�
 
 ## 入手と初回の準備
 
-[GitHub Releases](https://github.com/KotorinChunChun/TalkRecorder/releases) から Windows x64 版のZIPをダウンロードし、書き込み可能なフォルダーに展開します。最初の録音前に、展開したフォルダーで次を実行します。準備には PowerShell 7 とインターネット接続が必要です。
+KotorinToysの一覧でTalkRecorderを選び、「インストール」を押します。単体で導入する場合は、GitHub Releasesの `TalkRecorder-0.1.1-setup.exe` を使います。 [ダウンロード](https://github.com/KotorinChunChun/TalkRecorder/releases/tag/v0.1.1)
+
+最初の録音前に、導入先（既定では `%LOCALAPPDATA%\Programs\TalkRecorder`）で次の準備を行います。PowerShell 7とインターネット接続が必要です。
 
 ```powershell
 pwsh -NoProfile -File .\scripts\Prepare-Speech.ps1
@@ -19,6 +21,8 @@ pwsh -NoProfile -File .\scripts\Prepare-Encoder.ps1
 準備後に `TalkRecorder.exe` を開きます。音声処理には Vulkan を使える GPU ドライバーが必要です。
 
 **データの扱い**　標準構成では設定を `local/settings.json`、録音を `recordings` に保存します。保存先は設定画面で確認できます。
+
+ZIP版を使っていた場合は、停止してから設定と録音の保存先を確認してください。新しい導入先へ設定を引き継ぐには `local/settings.json` をコピーし、設定画面で録音先を確認します。
 
 ## 使い方
 
