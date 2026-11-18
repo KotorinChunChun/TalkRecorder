@@ -21,7 +21,7 @@ use std::{
         atomic::{AtomicU8, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tray_icon::{
     TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -48,6 +48,12 @@ pub fn run(path: PathBuf, startup: bool, origin: &'static str) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("画面を起動できません: {e}"))
 }
 
+struct InputPreview {
+    recorder: Recorder,
+    selection: Vec<(usize, String)>,
+    stopping: bool,
+}
+
 struct App {
     config: Config,
     device_settings: DeviceSettingsStore,
@@ -56,6 +62,9 @@ struct App {
     devices: Vec<DeviceInfo>,
     plugins: PluginCatalog,
     recorder: Option<Recorder>,
+    preview: Option<InputPreview>,
+    preview_retry_at: Instant,
+    recording_requested: bool,
     message: String,
     page: usize,
     tray: Option<TrayIcon>,
@@ -261,6 +270,9 @@ impl App {
             devices,
             plugins: discover_for_current_exe(),
             recorder: None,
+            preview: None,
+            preview_retry_at: Instant::now(),
+            recording_requested: false,
             message,
             page: 0,
             tray,
@@ -286,15 +298,11 @@ impl App {
         };
         if auto_record {
             // Recorder の準備処理が録音開始前に既存データの復旧を行う。
-            app.start_recording(false, true);
+            app.start_recording(true);
         }
         Ok(app)
     }
-    fn start(&mut self, preview: bool) {
-        self.start_recording(preview, false);
-    }
-
-    fn start_recording(&mut self, preview: bool, resident: bool) {
+    fn start_recording(&mut self, resident: bool) {
         if self.exit || self.recorder.is_some() || self.recovery.is_some() {
             return;
         }
@@ -302,7 +310,7 @@ impl App {
         let recording = if resident {
             Recorder::start_resident(self.config.clone())
         } else {
-            Recorder::start(self.config.clone(), preview)
+            Recorder::start(self.config.clone(), false)
         };
         match recording {
             Ok(r) => {
@@ -325,6 +333,53 @@ impl App {
             }
         }
     }
+
+    fn update_input_preview(&mut self, minimized: bool) {
+        if self
+            .preview
+            .as_ref()
+            .is_some_and(|p| p.recorder.is_finished())
+        {
+            let mut finished = self.preview.take().unwrap();
+            if finished.recorder.join().is_err() && !finished.stopping {
+                self.preview_retry_at = Instant::now() + Duration::from_secs(2);
+            }
+        }
+        if self.recording_requested && self.preview.is_none() {
+            self.recording_requested = false;
+            self.start_recording(false);
+        }
+        let selection = if !self.hidden && !minimized && self.page == 0 && self.can_edit_settings()
+        {
+            preview_selection(&self.config, &self.devices)
+        } else {
+            Vec::new()
+        };
+        if let Some(preview) = &mut self.preview {
+            if !preview.stopping && preview.selection != selection {
+                preview.stopping = true;
+                preview.recorder.stop();
+            }
+        } else if !selection.is_empty() && Instant::now() >= self.preview_retry_at {
+            match Recorder::start(self.config.clone(), true) {
+                Ok(recorder) => {
+                    self.preview = Some(InputPreview {
+                        recorder,
+                        selection,
+                        stopping: false,
+                    })
+                }
+                Err(_) => self.preview_retry_at = Instant::now() + Duration::from_secs(2),
+            }
+        }
+    }
+    fn can_edit_settings(&self) -> bool {
+        !self.exit
+            && !self.recording_requested
+            && self.recorder.is_none()
+            && self.recovery.is_none()
+    }
+
     fn remember_devices(&mut self) {
         refresh_device_names(&mut self.config, &self.devices);
         match self.device_settings.remember(&self.path, &self.config) {
@@ -339,6 +394,7 @@ impl App {
     fn request_exit(&mut self) {
         if !self.exit {
             self.exit = true;
+            self.recording_requested = false;
             self.hidden = false;
             if let Some(recorder) = &self.recorder {
                 recorder.stop();
@@ -349,10 +405,16 @@ impl App {
         }
     }
     fn devices(&mut self, ui: &mut egui::Ui) {
-        let status = self.recorder.as_ref().map(Recorder::status);
-        let can_edit = !self.exit && self.recorder.is_none() && self.recovery.is_none();
+        let recording = self.recorder.as_ref().map(Recorder::status);
+        let is_recording = recording
+            .as_ref()
+            .is_some_and(|s| s.phase == RecorderPhase::Recording);
+        let preview = self.preview.as_ref().filter(|p| !p.stopping);
+        let preview_status = preview.map(|p| p.recorder.status());
+        let can_edit = self.can_edit_settings();
         for (index, track) in self.config.tracks.iter_mut().enumerate() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
+                let mut status = recording.as_ref();
                 ui.horizontal(|ui| {
                     ui.add_enabled(
                         can_edit,
@@ -385,16 +447,27 @@ impl App {
                                 }
                             });
                     });
-                    let state = status
-                        .as_ref()
-                        .and_then(|s| s.speech.get(index))
-                        .copied()
-                        .unwrap_or(SpeechState::Unknown);
-                    ui.label(match state {
-                        SpeechState::Speech => "発話",
-                        SpeechState::Silence => "非発話",
-                        SpeechState::Unknown => "未判定",
-                    });
+                    if track.enabled && preview.is_some_and(|p| {
+                        p.selection.iter().any(|(slot, id)| *slot == index && *id == track.device_id)
+                    }) {
+                        status = status.or(preview_status.as_ref());
+                    }
+                    if recording.is_some() {
+                        let state = status
+                            .and_then(|s| s.speech.get(index))
+                            .copied()
+                            .unwrap_or(SpeechState::Unknown);
+                        ui.label(match state {
+                            SpeechState::Speech => "発話",
+                            SpeechState::Silence => "非発話",
+                            SpeechState::Unknown => "未判定",
+                        });
+                    } else if track.enabled && !track.device_id.is_empty() {
+                        let has_input = status.is_some_and(|s| {
+                            s.waves.get(index).is_some_and(|wave| !wave.is_empty())
+                        });
+                        ui.label(if has_input { "入力確認中" } else { "入力待ち" });
+                    }
                     if let Some(timing) = status.as_ref().and_then(|s| s.timing.get(index)).copied().flatten() {
                         match timing.mode {
                             ClockMode::Native => {},
@@ -405,7 +478,6 @@ impl App {
                     }
                 });
                 let wave = status
-                    .as_ref()
                     .and_then(|s| s.waves.get(index))
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
@@ -414,7 +486,11 @@ impl App {
                     egui::Sense::hover(),
                 );
                 let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 3., Color32::from_rgb(20, 29, 39));
+                painter.rect_filled(rect, 3., if is_recording {
+                    Color32::from_rgb(25, 34, 46)
+                } else {
+                    Color32::from_rgb(17, 23, 30)
+                });
                 painter.line_segment(
                     [
                         egui::pos2(rect.left(), rect.center().y),
@@ -435,7 +511,11 @@ impl App {
                         .collect();
                     painter.add(egui::Shape::line(
                         points,
-                        Stroke::new(1.3_f32, Color32::from_rgb(65, 208, 168)),
+                        Stroke::new(if is_recording { 1.6_f32 } else { 1.3_f32 }, if is_recording {
+                            Color32::from_rgb(94, 238, 185)
+                        } else {
+                            Color32::from_rgb(104, 150, 144)
+                        }),
                     ));
                 }
             });
@@ -658,6 +738,21 @@ fn refresh_device_names(config: &mut Config, devices: &[DeviceInfo]) {
     }
 }
 
+fn preview_selection(config: &Config, devices: &[DeviceInfo]) -> Vec<(usize, String)> {
+    config
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| {
+            track.enabled
+                && devices
+                    .iter()
+                    .any(|device| device.id == track.device_id && device.kind == track.kind)
+        })
+        .map(|(slot, track)| (slot, track.device_id.clone()))
+        .collect()
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(error) = self.tray_monitor.as_ref().and_then(TrayMonitor::take_error) {
@@ -747,7 +842,7 @@ impl eframe::App for App {
                 } else {
                     self.message = "通知領域を作成できません。終了ボタンを使ってください".into();
                 }
-            } else if self.recorder.is_some() || self.recovery.is_some() {
+            } else if self.recorder.is_some() || self.recovery.is_some() || self.preview.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
@@ -759,16 +854,13 @@ impl eframe::App for App {
                 Err(e) => format!("{e:#}"),
             };
         }
-        if self.exit && self.recorder.is_none() && self.recovery.is_none() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
         egui::TopBottomPanel::top("actions").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("TalkRecorder").strong().size(20.));
                 if self.recorder.is_none() {
                     if ui
                         .add_enabled(
-                            !self.exit && self.recovery.is_none(),
+                            self.can_edit_settings(),
                             egui::Button::new(self.stop_after_secs.map_or_else(
                                 || "録音開始".to_owned(),
                                 |limit| format!("録音開始（{limit:.0}秒）"),
@@ -776,16 +868,7 @@ impl eframe::App for App {
                         )
                         .clicked()
                     {
-                        self.start(false);
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.exit && self.recovery.is_none(),
-                            egui::Button::new("入力確認"),
-                        )
-                        .clicked()
-                    {
-                        self.start(true);
+                        self.recording_requested = true;
                     }
                 } else if ui.button("停止").clicked()
                     && let Some(r) = &self.recorder
@@ -793,10 +876,7 @@ impl eframe::App for App {
                     r.stop();
                 }
                 if ui
-                    .add_enabled(
-                        !self.exit && self.recorder.is_none() && self.recovery.is_none(),
-                        egui::Button::new("設定を保存"),
-                    )
+                    .add_enabled(self.can_edit_settings(), egui::Button::new("設定を保存"))
                     .clicked()
                 {
                     self.message = match self.config.save_atomic(&self.path) {
@@ -823,6 +903,23 @@ impl eframe::App for App {
                     .clicked()
                 {
                     self.request_exit();
+                }
+                if self
+                    .recorder
+                    .as_ref()
+                    .is_some_and(|r| r.phase_reader()() == RecorderPhase::Recording)
+                {
+                    ui.label(
+                        RichText::new("● 録音中")
+                            .strong()
+                            .color(if ui.visuals().dark_mode {
+                                Color32::LIGHT_RED
+                            } else {
+                                Color32::from_rgb(163, 27, 45)
+                            }),
+                    );
+                } else if self.recording_requested {
+                    ui.label("録音準備中");
                 }
             });
             ui.horizontal(|ui| {
@@ -891,16 +988,10 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| match self.page {
                 0 => self.devices(ui),
                 1 => {
-                    ui.add_enabled_ui(
-                        !self.exit && self.recorder.is_none() && self.recovery.is_none(),
-                        |ui| self.settings(ui),
-                    );
+                    ui.add_enabled_ui(self.can_edit_settings(), |ui| self.settings(ui));
                 }
                 _ => {
-                    ui.add_enabled_ui(
-                        !self.exit && self.recorder.is_none() && self.recovery.is_none(),
-                        |ui| self.speech_settings(ui),
-                    );
+                    ui.add_enabled_ui(self.can_edit_settings(), |ui| self.speech_settings(ui));
                 }
             });
         });
@@ -942,6 +1033,11 @@ impl eframe::App for App {
             }
         }
         self.remember_devices();
+        self.update_input_preview(ctx.input(|i| i.viewport().minimized.unwrap_or(false)));
+        if self.exit && self.recorder.is_none() && self.recovery.is_none() && self.preview.is_none()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         ctx.request_repaint_after(Duration::from_millis(if self.hidden { 500 } else { 100 }));
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

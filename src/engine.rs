@@ -179,8 +179,15 @@ impl Recorder {
         if config.auto_compact_wav && config.format == OutputFormat::Wav {
             config.format = OutputFormat::M4a;
         }
-        config.validate()?;
-        if !preview {
+        if preview {
+            ensure!(
+                (0.1..=60.0).contains(&config.reconnect_secs)
+                    && config.preview_secs > 0.0
+                    && config.preview_secs <= 600.0,
+                "波形表示時間・再接続間隔を確認してください"
+            );
+        } else {
+            config.validate()?;
             let plugins = crate::denoise_plugins::discover_for_current_exe();
             for track in config.tracks.iter().filter(|track| track.enabled) {
                 if let Some(id) = track.denoise.plugin_id() {
@@ -192,12 +199,20 @@ impl Recorder {
                 }
             }
         }
-        ensure!(
-            config.max_pending_secs >= 1.0,
-            "処理待ち上限は1秒以上にしてください"
-        );
+        if !preview {
+            ensure!(
+                config.max_pending_secs >= 1.0,
+                "処理待ち上限は1秒以上にしてください"
+            );
+        }
         let available = capture::enumerate_devices()?;
-        let (slots, devices) = select_devices(&config, &available)?;
+        let (slots, devices) = if preview {
+            let selection = preview_devices(&config, &available);
+            ensure!(!selection.0.is_empty(), "入力を取得できる機器がありません");
+            selection
+        } else {
+            select_devices(&config, &available)?
+        };
         if !preview {
             check_encoder(config.format, &config.ffmpeg_path)?;
         }
@@ -355,6 +370,21 @@ fn join_checked(handle: JoinHandle<Result<()>>, label: &str) -> Result<()> {
         .join()
         .map_err(|_| anyhow!("{label}スレッドが異常終了しました"))?
         .with_context(|| format!("{label}スレッドの処理に失敗しました"))
+}
+
+fn preview_devices(config: &Config, available: &[DeviceInfo]) -> (Vec<usize>, Vec<DeviceInfo>) {
+    config
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| track.enabled)
+        .filter_map(|(slot, track)| {
+            available
+                .iter()
+                .find(|device| device.id == track.device_id && device.kind == track.kind)
+                .map(|device| (slot, device.clone()))
+        })
+        .unzip()
 }
 
 fn select_devices(
@@ -617,6 +647,14 @@ fn run_session(
         ));
     }
     drop(sender);
+    if preview {
+        update(status, |status| {
+            status.phase = RecorderPhase::Preview;
+            status.message = "入力確認中".into();
+        });
+        let result = run_preview(&receiver, &config, &slots, requested, status);
+        return result.and(captures.join()).map(|()| false);
+    }
     let ready = match await_ready(
         &receiver,
         &mut devices,
@@ -641,15 +679,6 @@ fn run_session(
     }
     let origin = capture::qpc_100ns();
     let mut detector = ResumeDetector::new();
-    if preview {
-        update(status, |status| {
-            status.phase = RecorderPhase::Preview;
-            status.message = "入力確認中".into();
-        });
-        let result = run_preview(&receiver, &config, &slots, origin, requested, status);
-        let joined = captures.join();
-        return result.and(joined).map(|()| false);
-    }
     let channels: Vec<_> = devices.iter().map(|device| device.channels).collect();
     let folder = create_session_folder(&config.output_dir)?;
     let session_lock = Arc::new(SessionLock::acquire(&folder)?);
@@ -811,24 +840,28 @@ fn run_preview(
     receiver: &Receiver<CaptureEvent>,
     config: &Config,
     slots: &[usize],
-    origin: u64,
     stop: &AtomicBool,
     status: &SharedStatus,
 ) -> Result<()> {
     while !stop.load(Ordering::Acquire) {
         match receiver.recv_timeout(Duration::from_millis(20)) {
-            Ok(event) => {
-                update_wave(&event, config.preview_secs, slots, status);
-                if let CaptureEvent::Error { track, message } = event {
-                    bail!("デバイス{}: {message}", track + 1);
+            Ok(CaptureEvent::Connection {
+                track, connected, ..
+            }) => {
+                if let Some(&slot) = slots.get(track) {
+                    update(status, |status| {
+                        status.connected[slot] = connected;
+                        if !connected {
+                            status.waves[slot].clear();
+                        }
+                    });
                 }
             }
+            Ok(CaptureEvent::Error { track, message }) => bail!("デバイス{}: {message}", track + 1),
+            Ok(event) => update_wave(&event, config.preview_secs, slots, status),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => bail!("入力確認が予期せず終了しました"),
         }
-        update(status, |status| {
-            status.elapsed_secs = source_frames(origin) as f64 / RATE as f64
-        });
     }
     Ok(())
 }
@@ -1758,6 +1791,74 @@ mod tests {
             sample_rate: 48000,
             channels: ch,
         }
+    }
+
+    #[test]
+    fn preview_keeps_available_tracks_with_other_tracks_unconfigured() {
+        use crate::capture::DeviceKind::{Microphone, Speaker};
+        let mut config = Config::default();
+        config.tracks[1].enabled = true;
+        config.tracks[1].device_id = "offline".into();
+        config.tracks[2].enabled = true;
+        config.tracks[2].device_id = "render".into();
+        let available = [
+            fake_device("render", Speaker, 2),
+            fake_device("unused", Microphone, 1),
+        ];
+        assert!(config.validate().is_err());
+        let (slots, devices) = preview_devices(&config, &available);
+        assert_eq!(slots, [2]);
+        assert_eq!(devices[0].id, "render");
+    }
+
+    #[test]
+    fn preview_clears_only_the_disconnected_wave_and_accepts_new_samples() -> Result<()> {
+        let status = Arc::new(Mutex::new(Status::default()));
+        let config = Config::default();
+        let packet = |track, sample| CaptureEvent::Packet {
+            track,
+            sample_rate: 48_000,
+            channels: 1,
+            device_frame: 0,
+            qpc_100ns: 0,
+            samples: vec![sample; 480],
+            discontinuity: false,
+            timestamp_valid: true,
+        };
+        let process = |events: Vec<CaptureEvent>| -> Result<()> {
+            let (send, receive) = mpsc::sync_channel(4);
+            for event in events {
+                send.send(event)?;
+            }
+            drop(send);
+            let error = run_preview(&receive, &config, &[0, 2], &AtomicBool::new(false), &status)
+                .unwrap_err();
+            assert!(error.to_string().contains("入力確認が予期せず終了"));
+            Ok(())
+        };
+        process(vec![
+            packet(0, 0.1),
+            packet(1, 0.2),
+            CaptureEvent::Connection {
+                track: 0,
+                connected: false,
+                message: String::new(),
+            },
+        ])?;
+        assert!(status.lock().unwrap().waves[0].is_empty());
+        assert_eq!(status.lock().unwrap().waves[2], [0.2, 0.2]);
+        process(vec![
+            CaptureEvent::Connection {
+                track: 0,
+                connected: true,
+                message: String::new(),
+            },
+            packet(0, 0.3),
+        ])?;
+        let status = status.lock().unwrap();
+        assert!(status.connected[0]);
+        assert_eq!(status.waves[0], [0.3, 0.3]);
+        Ok(())
     }
 
     #[test]

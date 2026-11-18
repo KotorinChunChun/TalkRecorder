@@ -12,6 +12,10 @@ mod native {
     use talk_recorder::capture::{
         CaptureEvent, DeviceInfo, DeviceKind, enumerate_devices, start_capture_resilient,
     };
+    use talk_recorder::{
+        config::Config,
+        engine::{Recorder, RecorderPhase},
+    };
 
     struct CaptureGuard {
         stop: Arc<AtomicBool>,
@@ -110,6 +114,38 @@ mod native {
             CaptureEvent::Error { track, message } => counters[track].errors.push(message),
             CaptureEvent::Connection { .. } | CaptureEvent::Timing { .. } => {}
         }
+    }
+
+    #[test]
+    #[ignore = "明示実行専用。マイク入力の波形だけをメモリ内で確認します"]
+    fn selected_microphone_produces_a_waveform_without_saving() -> anyhow::Result<()> {
+        let devices = enumerate_devices()?;
+        let microphone = devices
+            .iter()
+            .find(|device| device.kind == DeviceKind::Microphone)
+            .ok_or_else(|| anyhow::anyhow!("検証用のマイクがありません"))?;
+        let scratch = tempfile::tempdir()?;
+        let output_dir = scratch.path().join("recordings");
+        let mut config = Config {
+            output_dir: output_dir.clone(),
+            ..Config::default()
+        };
+        config.tracks[0].device_id.clone_from(&microphone.id);
+        // 別の有効枠が未選択でも選択済みのマイクを確認できる。
+        config.tracks[1].enabled = true;
+        let mut preview = Recorder::start(config, true)?;
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline && !preview.is_finished() {
+            let status = preview.status();
+            if status.phase == RecorderPhase::Preview && status.waves[0].len() >= 2 {
+                preview.stop();
+                preview.join()?;
+                assert!(!output_dir.exists(), "波形確認が録音先を作成しました");
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        anyhow::bail!("マイクの波形が取得できませんでした");
     }
 
     #[test]
