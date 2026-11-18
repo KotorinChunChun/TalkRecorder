@@ -28,19 +28,25 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cargo の依存情報を取得できません' }
     $app = $metadata.packages | Where-Object id -eq $metadata.resolve.root
     $version = $app.version
-    $exe = Join-Path $metadata.target_directory 'release/TalkRecorder.exe'
-    $resource = (Get-Item -LiteralPath $exe).VersionInfo
-    if ($resource.ProductName -ne 'TalkRecorder' -or $resource.FileVersion -ne $version) {
-        throw '配布EXEの製品名・ファイル版が一致しません'
-    }
-    $binary = [IO.File]::ReadAllBytes($exe)
-    foreach ($encoding in @([Text.Encoding]::UTF8, [Text.Encoding]::Unicode)) {
-        $strings = $encoding.GetString($binary)
-        foreach ($entry in $roots) {
-            if ($entry.path) {
-                foreach ($path in @($entry.path, $entry.path.Replace('\','/'))) {
-                    if ($strings.Contains($path, [StringComparison]::OrdinalIgnoreCase)) {
-                        throw '配布EXEに開発PCの絶対パスが含まれています'
+    $executables = @('TalkRecorder.exe', 'TalkRecorder-cli.exe' | ForEach-Object {
+        Join-Path $metadata.target_directory "release/$_"
+    })
+    foreach ($exe in $executables) {
+        $item = Get-Item -LiteralPath $exe
+        $resource = $item.VersionInfo
+        if ($resource.ProductName -ne 'TalkRecorder' -or $resource.FileVersion -ne $version -or
+            $resource.OriginalFilename -ne $item.Name) {
+            throw '配布EXEの製品名・ファイル版が一致しません'
+        }
+        $binary = [IO.File]::ReadAllBytes($exe)
+        foreach ($encoding in @([Text.Encoding]::UTF8, [Text.Encoding]::Unicode)) {
+            $strings = $encoding.GetString($binary)
+            foreach ($entry in $roots) {
+                if ($entry.path) {
+                    foreach ($path in @($entry.path, $entry.path.Replace('\','/'))) {
+                        if ($strings.Contains($path, [StringComparison]::OrdinalIgnoreCase)) {
+                            throw '配布EXEに開発PCの絶対パスが含まれています'
+                        }
                     }
                 }
             }
@@ -52,7 +58,7 @@ try {
     foreach ($dir in @($stage, "$stage/docs", "$stage/scripts", "$stage/licenses", $release)) {
         [IO.Directory]::CreateDirectory($dir) | Out-Null
     }
-    Copy-Item -LiteralPath $exe,README.md,LICENSE -Destination $stage
+    Copy-Item -LiteralPath ($executables + @('README.md', 'LICENSE')) -Destination $stage
     Copy-Item -LiteralPath docs/user-guide.md,docs/features.md,docs/denoise-plugins.md,docs/development.md -Destination "$stage/docs"
     Copy-Item -LiteralPath scripts/Prepare-Speech.ps1,scripts/Prepare-Encoder.ps1 -Destination "$stage/scripts"
     $reachable = [Collections.Generic.HashSet[string]]::new()

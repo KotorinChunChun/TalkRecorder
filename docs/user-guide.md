@@ -4,6 +4,20 @@
 
 マイクとスピーカーの会話を同時に録音し、共通の非発話部分を短くして、デバイスごとの音声ファイルへ保存するアプリです。まずはM4A・標準の会話判定で使用できます。文字起こしを有効にする必要はありません。
 
+## コマンドラインから使う
+
+導入先の `TalkRecorder-cli.exe` を PowerShell で実行します。`--config` には、入力デバイスを設定済みのJSONを指定します。 `--list-devices` でデバイスIDを確認でき、 `--write-default-config` で試験用の初期設定ファイルを作成できます。
+
+```powershell
+.\TalkRecorder-cli.exe --list-devices
+.\TalkRecorder-cli.exe --preview --config .\local\settings.json --stop-after-secs 3
+.\TalkRecorder-cli.exe --record --config .\local\settings.json --stop-after-secs 30
+```
+
+`--preview` は入力の接続と波形の最大振幅を表示し、音声ファイルを作りません。`--record` は指定した保存先に音声を分割保存します。どちらも標準出力に状態を1行ずつJSONで出力します。録音の状態は `phase`、分割保存の進捗は `save`、保存先は `folder` で確認できます。
+
+時間を指定しない録音では、標準入力に `stop` と入力して改行するか、コンソールで Ctrl+C を押します。標準入力を閉じた場合も停止します。時間を指定した場合は指定時間で停止し、途中で同じ操作を使えます。停止後は保存の完了を待ち、最後に `finished` または `failed` を出力します。失敗したときは終了コードがゼロ以外になります。
+
 機能の詳しい範囲は[機能一覧](features.md)を参照してください。
 
 ## 1. 起動する

@@ -40,7 +40,8 @@ const CAPTURE_LAG: u64 = 14_400;
 #[cfg(test)]
 mod capacity_tests;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RecorderPhase {
     Preparing,
     Preview,
@@ -864,7 +865,16 @@ fn run_preview(
     stop: &AtomicBool,
     status: &SharedStatus,
 ) -> Result<()> {
+    let started = Instant::now();
+    let mut next_update = started;
     while !stop.load(Ordering::Acquire) {
+        let now = Instant::now();
+        if now >= next_update {
+            update(status, |status| {
+                status.elapsed_secs = (now - started).as_secs_f64();
+            });
+            next_update = now + Duration::from_millis(100);
+        }
         match receiver.recv_timeout(Duration::from_millis(20)) {
             Ok(CaptureEvent::Connection {
                 track, connected, ..
@@ -884,6 +894,9 @@ fn run_preview(
             Err(RecvTimeoutError::Disconnected) => bail!("入力確認が予期せず終了しました"),
         }
     }
+    update(status, |status| {
+        status.elapsed_secs = started.elapsed().as_secs_f64()
+    });
     Ok(())
 }
 

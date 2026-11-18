@@ -1,6 +1,7 @@
 //! 内部確定済み音声の結合を、取得・解析から独立して実行する。
 use crate::journal::JournalWriter;
 use anyhow::{Result, anyhow, bail};
+use serde::Serialize;
 use std::{
     sync::{
         Arc, Mutex,
@@ -20,7 +21,7 @@ struct Job {
     pause: Option<std::sync::mpsc::Receiver<()>>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SaveProgress {
     pub queued: usize,
     pub active: Option<ActiveSave>,
@@ -35,7 +36,7 @@ impl SaveProgress {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ActiveSave {
     pub number: u64,
     pub parts: Option<(u64, u64)>,

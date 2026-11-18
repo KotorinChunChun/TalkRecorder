@@ -1,3 +1,10 @@
+#ifndef APP_FILENAME
+#define APP_FILENAME "TalkRecorder.exe"
+#endif
+#ifndef APP_DESCRIPTION
+#define APP_DESCRIPTION "TalkRecorder"
+#endif
+
 1 VERSIONINFO
 FILEVERSION APP_VERSION
 PRODUCTVERSION APP_VERSION
@@ -8,9 +15,9 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "FileDescription", "TalkRecorder"
+            VALUE "FileDescription", APP_DESCRIPTION
             VALUE "FileVersion", APP_VERSION_TEXT
-            VALUE "OriginalFilename", "TalkRecorder.exe"
+            VALUE "OriginalFilename", APP_FILENAME
             VALUE "ProductName", "TalkRecorder"
             VALUE "ProductVersion", APP_VERSION_TEXT
         END

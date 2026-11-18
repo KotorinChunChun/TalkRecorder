@@ -1,0 +1,3 @@
+#define APP_FILENAME "TalkRecorder-cli.exe"
+#define APP_DESCRIPTION "TalkRecorder CLI"
+#include "version.rc"
