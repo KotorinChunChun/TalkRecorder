@@ -211,6 +211,26 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
 
+    fn check_status(id: &str, detail: &str) -> Result<Duration> {
+        let timeout = Duration::from_secs(2);
+        let started = Instant::now();
+        let mut client = pipe::test_client(id, timeout)?;
+        client.write_all(b"status\n")?;
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line)?;
+        let elapsed = started.elapsed();
+        ensure!(elapsed < timeout, "本体の照会期限を超えました: {elapsed:?}");
+        let reply: serde_json::Value = serde_json::from_str(&line)?;
+        assert_eq!(reply["pid"], std::process::id());
+        assert_eq!(reply["version"], APP_VERSION);
+        assert_eq!(reply["protocolVersion"], 2);
+        assert_eq!(reply["ready"], true);
+        assert_eq!(reply["launchOrigin"], "via_kotorintoys");
+        assert_eq!(reply["result"], "completed");
+        assert_eq!(reply["detail"], detail);
+        Ok(elapsed)
+    }
+
     #[test]
     fn status_survives_idle_wait_and_new_clients_during_recording_and_save() -> Result<()> {
         let id = format!("talk-recorder-status-{}", std::process::id());
@@ -229,20 +249,47 @@ mod tests {
         ] {
             state.watch(move || phase);
             for _ in 0..4 {
-                let mut client = pipe::test_client(&id, Duration::from_secs(2))?;
-                client.write_all(b"status\n")?;
-                let mut line = String::new();
-                BufReader::new(client).read_line(&mut line)?;
-                let reply: serde_json::Value = serde_json::from_str(&line)?;
-                assert_eq!(reply["pid"], std::process::id());
-                assert_eq!(reply["protocolVersion"], 2);
-                assert_eq!(reply["ready"], true);
-                assert_eq!(reply["launchOrigin"], "via_kotorintoys");
-                assert_eq!(reply["result"], "completed");
-                assert_eq!(reply["detail"], detail);
+                check_status(&id, detail)?;
             }
         }
         drop(management);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_status_clients_reconnect_after_an_interrupted_request() -> Result<()> {
+        const CLIENTS: usize = 8;
+        let id = format!("talk-recorder-overlapping-{}", std::process::id());
+        let status = Arc::new(RecordingStatus::default());
+        status.watch(|| RecorderPhase::Recording);
+        let _management =
+            Management::start_on(id.clone(), "via_kotorintoys", status, || {}, || {})?;
+        let timeout = Duration::from_secs(2);
+        let mut longest = Duration::ZERO;
+        for _ in 0..6 {
+            let mut interrupted = pipe::test_client(&id, timeout)?;
+            interrupted.write_all(b"stat")?;
+            let ready = std::sync::Barrier::new(CLIENTS + 1);
+            thread::scope(|scope| -> Result<()> {
+                let callers = (0..CLIENTS)
+                    .map(|_| {
+                        scope.spawn(|| -> Result<Duration> {
+                            ready.wait();
+                            check_status(&id, "録音中")
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                ready.wait();
+                // 他の照会が待機してから、改行を送らずに前のクライアントを閉じる。
+                thread::sleep(Duration::from_millis(100));
+                drop(interrupted);
+                for caller in callers {
+                    longest = longest.max(caller.join().expect("照会試験スレッド")?);
+                }
+                Ok(())
+            })?;
+        }
+        eprintln!("{} 件の同時・連続照会。最長 {longest:?}", 6 * CLIENTS);
         Ok(())
     }
 }
