@@ -58,13 +58,23 @@ impl Management {
         show: impl Fn() + Send + 'static,
         stop: impl Fn() + Send + 'static,
     ) -> Result<Self> {
+        Self::start_on(TOOL_ID.to_owned(), origin, status, show, stop)
+    }
+
+    fn start_on(
+        id: String,
+        origin: &'static str,
+        status: Arc<RecordingStatus>,
+        show: impl Fn() + Send + 'static,
+        stop: impl Fn() + Send + 'static,
+    ) -> Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let cancel = shutdown.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("talkrecorder-management".into())
             .spawn(move || {
-                let server = match pipe::ManagementPipe::create(TOOL_ID) {
+                let server = match pipe::ManagementPipe::create(&id) {
                     Ok(server) => {
                         let _ = sender.send(Ok(()));
                         server
@@ -76,8 +86,13 @@ impl Management {
                 };
                 let mut stopping = false;
                 while !cancel.load(Ordering::Acquire) {
-                    if server.accept(Duration::from_millis(100)).is_err() {
-                        continue;
+                    match server.accept(&cancel) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => {
+                            eprintln!("管理窓口の待機を終了: {error:#}");
+                            break;
+                        }
                     }
                     let deadline = Instant::now() + Duration::from_millis(1500);
                     let parsed = server
@@ -188,5 +203,46 @@ fn response<'a>(
             Action::Stop,
         ),
         _ => (id, "unsupported", "未対応の操作です。", Action::None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+
+    #[test]
+    fn status_survives_idle_wait_and_new_clients_during_recording_and_save() -> Result<()> {
+        let id = format!("talk-recorder-status-{}", std::process::id());
+        let state = Arc::new(RecordingStatus::default());
+        let management =
+            Management::start_on(id.clone(), "via_kotorintoys", state.clone(), || {}, || {})?;
+        let mut abandoned = pipe::test_client(&id, Duration::from_secs(2))?;
+        abandoned.write_all(b"stat")?;
+        drop(abandoned);
+        // 旧版が接続I/Oを再発行した100msの周期を複数回跨ぐ。
+        thread::sleep(Duration::from_millis(350));
+        for (phase, detail) in [
+            (RecorderPhase::Finished, "待機中"),
+            (RecorderPhase::Recording, "録音中"),
+            (RecorderPhase::Finalizing, "録音を保存中"),
+        ] {
+            state.watch(move || phase);
+            for _ in 0..4 {
+                let mut client = pipe::test_client(&id, Duration::from_secs(2))?;
+                client.write_all(b"status\n")?;
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line)?;
+                let reply: serde_json::Value = serde_json::from_str(&line)?;
+                assert_eq!(reply["pid"], std::process::id());
+                assert_eq!(reply["protocolVersion"], 2);
+                assert_eq!(reply["ready"], true);
+                assert_eq!(reply["launchOrigin"], "via_kotorintoys");
+                assert_eq!(reply["result"], "completed");
+                assert_eq!(reply["detail"], detail);
+            }
+        }
+        drop(management);
+        Ok(())
     }
 }

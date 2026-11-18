@@ -1,6 +1,8 @@
 //! 利用者SIDに限定した名前付きパイプと期限付きI/O。
-use anyhow::ensure;
+use anyhow::{Context, ensure};
+use std::io;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Authorization::*;
@@ -118,13 +120,55 @@ impl ManagementPipe {
         })
     }
 
-    pub(super) fn accept(&self, timeout: Duration) -> anyhow::Result<()> {
+    pub(super) fn accept(&self, shutdown: &AtomicBool) -> anyhow::Result<bool> {
         let mut operation = self.operation()?;
         let started = unsafe { ConnectNamedPipe(self.handle.0, &mut operation.0) };
-        if started == 0 && unsafe { GetLastError() } == ERROR_PIPE_CONNECTED {
-            return Ok(());
+        if started != 0 {
+            return Ok(true);
         }
-        self.finish(started, &mut operation.0, timeout).map(|_| ())
+        match unsafe { GetLastError() } {
+            ERROR_PIPE_CONNECTED => Ok(true),
+            ERROR_IO_PENDING => self.wait_for_connection(&mut operation.0, shutdown),
+            code => self.handle_connect_error(code),
+        }
+    }
+
+    fn wait_for_connection(
+        &self,
+        operation: &mut OVERLAPPED,
+        shutdown: &AtomicBool,
+    ) -> anyhow::Result<bool> {
+        // 通常の待機で接続I/Oを取り消さない。取消しと接続完了が競合するのは終了時だけ。
+        while !shutdown.load(Ordering::Acquire) {
+            match unsafe { WaitForSingleObject(operation.hEvent, 100) } {
+                WAIT_OBJECT_0 => {
+                    return match self.io_result(operation, false) {
+                        Ok(_) => Ok(true),
+                        Err(error) => self
+                            .handle_connect_error(error.raw_os_error().unwrap_or_default() as u32),
+                    };
+                }
+                WAIT_TIMEOUT => {}
+                _ => {
+                    let error = io::Error::last_os_error();
+                    self.cancel_and_wait(operation);
+                    return Err(error).context("管理接続を待機できません");
+                }
+            }
+        }
+        self.cancel_and_wait(operation);
+        Ok(false)
+    }
+
+    fn handle_connect_error(&self, code: u32) -> anyhow::Result<bool> {
+        match code {
+            ERROR_NO_DATA | ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED => {
+                // 相手が先に閉じた場合も、サーバー側を切断状態に戻して次を受け付ける。
+                self.disconnect();
+                Ok(false)
+            }
+            _ => Err(io::Error::from_raw_os_error(code as i32)).context("管理窓口に接続できません"),
+        }
     }
 
     pub(super) fn same_session(&self) -> anyhow::Result<bool> {
@@ -227,19 +271,27 @@ impl ManagementPipe {
                 )
             } != WAIT_OBJECT_0
             {
-                // バッファとOVERLAPPEDを破棄する前にキャンセル完了を回収する。
-                unsafe { CancelIoEx(self.handle.0, operation) };
-                let mut ignored = 0;
-                unsafe { GetOverlappedResult(self.handle.0, operation, &mut ignored, 1) };
+                self.cancel_and_wait(operation);
                 anyhow::bail!("管理I/Oが時間切れです");
             }
         }
+        self.io_result(operation, false)
+            .context("管理I/Oを完了できません")
+    }
+
+    fn cancel_and_wait(&self, operation: &mut OVERLAPPED) {
+        // バッファとOVERLAPPEDを破棄する前に、取消しまたはI/O完了を回収する。
+        unsafe { CancelIoEx(self.handle.0, operation) };
+        let _ = self.io_result(operation, true);
+    }
+
+    fn io_result(&self, operation: &mut OVERLAPPED, wait: bool) -> io::Result<u32> {
         let mut count = 0;
-        ensure!(
-            unsafe { GetOverlappedResult(self.handle.0, operation, &mut count, 0) } != 0,
-            "管理I/Oを完了できません"
-        );
-        Ok(count)
+        if unsafe { GetOverlappedResult(self.handle.0, operation, &mut count, wait as i32) } != 0 {
+            Ok(count)
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     pub(super) fn wait_for_client_close(&self, deadline: Instant) {
@@ -263,5 +315,56 @@ impl ManagementPipe {
 
     pub(super) fn disconnect(&self) {
         unsafe { DisconnectNamedPipe(self.handle.0) };
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_client(id: &str, timeout: Duration) -> anyhow::Result<std::fs::File> {
+    let sid = current_user_sid()?;
+    let name = format!(r"\\.\pipe\KotorinToys.{sid}.{id}");
+    let deadline = Instant::now() + timeout;
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name)
+        {
+            Ok(client) => return Ok(client),
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error).context("試験クライアントが接続できません"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnects_after_client_opens_and_closes_before_accept() -> anyhow::Result<()> {
+        let id = format!("talk-recorder-abandoned-{}", std::process::id());
+        let server = ManagementPipe::create(&id)?;
+        let shutdown = AtomicBool::new(false);
+        drop(test_client(&id, Duration::ZERO)?);
+        assert!(!server.accept(&shutdown)?);
+
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let next = scope.spawn(|| {
+                let client = test_client(&id, Duration::from_secs(2));
+                if client.is_err() {
+                    shutdown.store(true, Ordering::Release);
+                }
+                client
+            });
+            assert!(server.accept(&shutdown)?);
+            let _client = next.join().expect("接続試験スレッド")?;
+            assert!(server.same_session()?);
+            Ok(())
+        })
     }
 }
