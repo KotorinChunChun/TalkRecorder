@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow, bail};
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -20,10 +20,33 @@ struct Job {
     pause: Option<std::sync::mpsc::Receiver<()>>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SaveProgress {
+    pub queued: usize,
+    pub active: Option<ActiveSave>,
+    pub saved: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+impl SaveProgress {
+    fn pending(self) -> usize {
+        self.queued + usize::from(self.active.is_some())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveSave {
+    pub number: u64,
+    pub parts: Option<(u64, u64)>,
+}
+
+pub type SharedSaveProgress = Arc<Mutex<SaveProgress>>;
+
 #[derive(Clone)]
 pub struct FinalizerClient {
     sender: SyncSender<Option<Job>>,
-    pending: Arc<AtomicUsize>,
+    progress: SharedSaveProgress,
     error: Arc<Mutex<Option<String>>>,
     session_lock: Option<Arc<crate::recovery::SessionLock>>,
     closed: Arc<AtomicBool>,
@@ -52,16 +75,19 @@ impl FinalizerClient {
             "公開音声の結合処理は終了しています。内部確定音声は保持されています"
         );
         self.check()?;
-        self.pending.fetch_add(1, Ordering::AcqRel);
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(error) = self.sender.try_send(Some(job)) {
-            self.pending.fetch_sub(1, Ordering::AcqRel);
             bail!("公開音声の結合待ちが上限に達しました。内部確定音声は保持されています: {error}");
         }
+        progress.queued += 1;
         Ok(())
+    }
+    pub fn snapshot(&self) -> SaveProgress {
+        *self.progress.lock().unwrap_or_else(|e| e.into_inner())
     }
     pub fn check(&self) -> Result<()> {
         anyhow::ensure!(
-            self.alive.load(Ordering::Acquire) || self.pending.load(Ordering::Acquire) == 0,
+            self.alive.load(Ordering::Acquire) || self.snapshot().pending() == 0,
             "公開音声の結合スレッドが未処理の音声を残して終了しました。内部音声は復旧可能です"
         );
         if let Some(error) = self
@@ -75,7 +101,7 @@ impl FinalizerClient {
         Ok(())
     }
     pub fn wait(&self) -> Result<()> {
-        while self.pending.load(Ordering::Acquire) > 0 {
+        while self.snapshot().pending() > 0 {
             self.check()?;
             thread::sleep(Duration::from_millis(10));
         }
@@ -108,9 +134,9 @@ impl Default for Finalizer {
 impl Finalizer {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::sync_channel::<Option<Job>>(2);
-        let pending = Arc::new(AtomicUsize::new(0));
+        let progress = SharedSaveProgress::default();
         let error = Arc::new(Mutex::new(None));
-        let count = pending.clone();
+        let worker_progress = progress.clone();
         let fault = error.clone();
         let closed = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
@@ -118,30 +144,49 @@ impl Finalizer {
         let handle = thread::spawn(move || {
             let _alive = WorkerExit(worker_alive);
             while let Ok(Some(job)) = receiver.recv() {
+                let number = job.writer.number();
+                {
+                    let mut progress = worker_progress.lock().unwrap_or_else(|e| e.into_inner());
+                    progress.queued -= 1;
+                    progress.active = Some(ActiveSave {
+                        number,
+                        parts: None,
+                    });
+                }
                 #[cfg(test)]
                 if let Some(gate) = &job.pause {
                     let _ = gate.recv_timeout(Duration::from_secs(5));
                 }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    job.writer.finish(job.source_until, job.discard)
-                }));
-                let failure = match result {
-                    Ok(Ok(())) => None,
-                    Ok(Err(error)) => Some(format!("{error:#}")),
-                    Err(_) => Some("結合スレッドの処理が異常終了しました".into()),
-                };
-                if let Some(message) = failure {
+                    job.writer
+                        .finish_with_progress(job.source_until, job.discard, |done, total| {
+                            let mut progress =
+                                worker_progress.lock().unwrap_or_else(|e| e.into_inner());
+                            progress.active = Some(ActiveSave {
+                                number,
+                                parts: Some((done, total)),
+                            });
+                        })
+                }))
+                .unwrap_or_else(|_| Err(anyhow!("結合スレッドの処理が異常終了しました")));
+                if let Err(error) = &result {
                     let mut first = fault.lock().unwrap_or_else(|e| e.into_inner());
-                    first.get_or_insert(message);
+                    first.get_or_insert_with(|| format!("{error:#}"));
                 }
                 drop(job._session_lock);
-                count.fetch_sub(1, Ordering::AcqRel);
+                let mut progress = worker_progress.lock().unwrap_or_else(|e| e.into_inner());
+                progress.active = None;
+                match result {
+                    Ok(true) => progress.saved += 1,
+                    Ok(false) => progress.skipped += 1,
+                    Err(_) => progress.failed += 1,
+                }
             }
         });
         Self {
             client: Some(FinalizerClient {
                 sender,
-                pending,
+                progress,
                 error,
                 session_lock: None,
                 closed,
@@ -153,6 +198,13 @@ impl Finalizer {
     }
     pub fn client(&self) -> FinalizerClient {
         self.client.as_ref().expect("終了前の結合処理").clone()
+    }
+    pub fn progress(&self) -> SharedSaveProgress {
+        self.client
+            .as_ref()
+            .expect("終了前の結合処理")
+            .progress
+            .clone()
     }
     pub fn finish(mut self) -> Result<()> {
         let client = self.client.take().expect("結合処理");
@@ -211,6 +263,7 @@ mod tests {
         let external = service.client();
         external.submit(prepared(directory.path(), 1)?, 100, false)?;
         bounded(move || service.finish())?;
+        assert_eq!(external.snapshot().saved, 1);
         assert!(directory.path().join("000001.complete.json").exists());
         for (track, channels) in [1, 2].into_iter().enumerate() {
             assert_eq!(
@@ -257,6 +310,8 @@ mod tests {
         )?;
         client.submit(writer, 100, false)?;
         assert!(service.finish().is_err());
+        assert_eq!(client.snapshot().failed, 1);
+        assert_eq!(client.snapshot().saved, 0);
         assert!(client.check().is_err());
         assert!(client.wait().is_err());
         assert_eq!(
@@ -278,7 +333,7 @@ mod tests {
         drop(receiver);
         FinalizerClient {
             sender,
-            pending: Arc::new(AtomicUsize::new(0)),
+            progress: SharedSaveProgress::default(),
             error: Arc::new(Mutex::new(None)),
             session_lock: None,
             closed: Arc::new(AtomicBool::new(false)),
@@ -296,7 +351,7 @@ mod tests {
                 .submit(prepared(directory.path(), 1)?, 100, false)
                 .is_err()
         );
-        assert_eq!(disconnected.pending.load(Ordering::Acquire), 0);
+        assert_eq!(disconnected.snapshot().pending(), 0);
         assert!(
             directory
                 .path()
@@ -316,7 +371,7 @@ mod tests {
                 .submit(prepared(directory.path(), 4)?, 100, false)
                 .is_err()
         );
-        assert_eq!(client.pending.load(Ordering::Acquire), 2);
+        assert_eq!(client.snapshot().pending(), 2);
         assert!(
             directory
                 .path()
@@ -378,7 +433,7 @@ mod tests {
                 .submit(prepared(directory.path(), 2)?, 100, false)
                 .is_err()
         );
-        assert_eq!(client.pending.load(Ordering::Acquire), 1);
+        assert_eq!(client.snapshot().pending(), 1);
         release.send(())?;
         service.finish()?;
         assert!(!journal::load_state(directory.path(), 2)?.unwrap().published);
@@ -387,6 +442,60 @@ mod tests {
                 .path()
                 .join("journal/000002/000001_track1.wav")
                 .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn progress_distinguishes_active_queued_saved_and_skipped() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let service = Finalizer::new();
+        let client = service.client();
+        let (release, gate) = mpsc::sync_channel(1);
+        client.enqueue(Job {
+            writer: prepared(directory.path(), 1)?,
+            source_until: 100,
+            discard: false,
+            _session_lock: None,
+            pause: Some(gate),
+        })?;
+        let mut silent = JournalWriter::new(
+            directory.path(),
+            2,
+            vec![1],
+            OutputFormat::Wav,
+            Path::new("missing"),
+        )?;
+        silent.prepare_finish(100, true)?;
+        client.submit(silent, 100, true)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while client.snapshot().active.is_none() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "保存スレッドが開始しません"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            client.snapshot(),
+            SaveProgress {
+                queued: 1,
+                active: Some(ActiveSave {
+                    number: 1,
+                    parts: None
+                }),
+                ..SaveProgress::default()
+            }
+        );
+        release.send(())?;
+        service.finish()?;
+        assert_eq!(
+            client.snapshot(),
+            SaveProgress {
+                saved: 1,
+                skipped: 1,
+                ..SaveProgress::default()
+            }
         );
         Ok(())
     }

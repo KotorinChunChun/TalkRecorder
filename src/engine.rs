@@ -24,7 +24,7 @@ use crate::{
     config::{Config, OutputFormat},
     disk_space::{SpaceMonitor, SpaceReading},
     editor::{EditAction, Editor},
-    finalize::{Finalizer, FinalizerClient},
+    finalize::{Finalizer, FinalizerClient, SaveProgress, SharedSaveProgress},
     journal::JournalWriter,
     maintenance,
     power::{ResumeDetector, SleepGuard},
@@ -132,6 +132,7 @@ pub struct Status {
     pub elapsed_secs: f64,
     pub saved_secs: f64,
     pub pending_secs: f64,
+    save_progress: SharedSaveProgress,
     pub folder: Option<PathBuf>,
     pub waves: Vec<Vec<f32>>,
     pub speech: Vec<SpeechState>,
@@ -149,12 +150,28 @@ impl Default for Status {
             elapsed_secs: 0.0,
             saved_secs: 0.0,
             pending_secs: 0.0,
+            save_progress: SharedSaveProgress::default(),
             folder: None,
             waves: vec![Vec::new(); 4],
             speech: vec![SpeechState::Unknown; 4],
             connected: vec![false; 4],
             timing: vec![None; 4],
         }
+    }
+}
+
+impl Status {
+    pub fn save_progress(&self) -> SaveProgress {
+        *self.save_progress.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_finalizing(&mut self, stage: &str) {
+        self.phase = RecorderPhase::Finalizing;
+        self.running = false;
+        self.message = self.capacity_stop.as_ref().map_or_else(
+            || stage.into(),
+            |reason| format!("{}。{stage}", reason.description()),
+        );
     }
 }
 
@@ -288,17 +305,20 @@ impl Recorder {
                 } else {
                     RecorderPhase::Failed
                 };
+                let saved = status.folder.as_ref().map(|_| {
+                    let progress = status.save_progress();
+                    format!(
+                        "録音停止・保存完了（保存 {} 区間、除外 {} 区間）",
+                        progress.saved, progress.skipped
+                    )
+                });
                 status.message = match (&result, &status.capacity_stop) {
                     (Ok(()), Some(reason)) => format!(
                         "{}。{}",
                         reason.description(),
-                        if status.folder.is_some() {
-                            "録音を停止しました（保存処理完了）"
-                        } else {
-                            "録音を開始しませんでした"
-                        }
+                        saved.as_deref().unwrap_or("録音を開始しませんでした")
                     ),
-                    (Ok(()), None) => "停止しました".into(),
+                    (Ok(()), None) => saved.unwrap_or_else(|| "停止しました".into()),
                     (Err(error), Some(reason)) => {
                         format!("{}。停止: {error:#}", reason.description())
                     }
@@ -330,14 +350,9 @@ impl Recorder {
         update(&self.status, |status| {
             if !matches!(
                 status.phase,
-                RecorderPhase::Finished | RecorderPhase::Failed
+                RecorderPhase::Finalizing | RecorderPhase::Finished | RecorderPhase::Failed
             ) {
-                status.phase = RecorderPhase::Finalizing;
-                status.running = false;
-                status.message = status.capacity_stop.as_ref().map_or_else(
-                    || "停止処理中".into(),
-                    |reason| format!("{}。停止・保存中", reason.description()),
-                );
+                status.set_finalizing("取り込みを停止中");
             }
         });
     }
@@ -525,6 +540,7 @@ fn run(
     }
     let _sleep_guard = SleepGuard::new(config.prevent_sleep && !preview)?;
     let finalizer = Finalizer::new();
+    update(status, |s| s.save_progress = finalizer.progress());
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Acquire) {
             let attempt = run_session(
@@ -548,6 +564,11 @@ fn run(
         }
         Ok(())
     })();
+    update(status, |s| {
+        if s.folder.is_some() {
+            s.set_finalizing("取り込み停止・音声ファイルを保存中");
+        }
+    });
     let finalized = finalizer.finish();
     // 現在の録音の確定を優先し、容量停止後に過去WAVの追加変換を始めない。
     let capacity_stopped = status
@@ -557,10 +578,12 @@ fn run(
         .is_some();
     let allow_maintenance = !preview
         && !capacity_stopped
+        && config.auto_compact_wav
         && capacity
             .check_now()
             .is_ok_and(|reading| reading.is_none_or(|reading| !reading.is_low()));
     let maintenance = if allow_maintenance {
+        update(status, |s| s.set_finalizing("過去のWAVを確認・圧縮中"));
         let report = maintenance::run(config, false)?;
         let errors: Vec<_> = report.errors().cloned().collect();
         if errors.is_empty() {
@@ -746,13 +769,8 @@ fn run_session(
     // ReleaseBuffer 後にキューへ到着する最後のパケットも回収する。
     let end = resume.end(source_frames(origin), spool.frames);
     update(status, |status| {
-        status.running = false;
-        status.phase = RecorderPhase::Finalizing;
+        status.set_finalizing("取り込みを停止中");
         status.elapsed_secs = end as f64 / RATE as f64;
-        status.message = status.capacity_stop.as_ref().map_or_else(
-            || "取得済み音声を確定中".into(),
-            |reason| format!("{}。停止・保存中", reason.description()),
-        );
     });
     let joined = captures.join();
     let flushed = flush_capture(
@@ -766,6 +784,9 @@ fn run_session(
         status,
     );
     // 捕捉スレッドの終了を待ち、生成済みの prefix を最後まで解析する。
+    update(status, |s| {
+        s.set_finalizing("取り込み停止・残りの音声を解析中")
+    });
     progress.done.store(true, Ordering::Release);
     let analyzed = join_checked(processing, "音声解析・保存");
     let result = acquired.and(joined).and(flushed).and(analyzed);
@@ -1484,7 +1505,7 @@ mod tests {
     use crate::config::OutputFormat;
 
     #[test]
-    fn phase_reader_tracks_changes_and_stop_does_not_overwrite_terminal_state() {
+    fn phase_reader_tracks_changes_and_stop_does_not_overwrite_saving_or_terminal_state() {
         let status = Arc::new(Mutex::new(Status {
             phase: RecorderPhase::Preparing,
             ..Status::default()
@@ -1500,6 +1521,11 @@ mod tests {
         assert_eq!(read(), RecorderPhase::Preview);
         recorder.stop();
         assert_eq!(read(), RecorderPhase::Finalizing);
+        update(&status, |status| {
+            status.set_finalizing("音声ファイルを保存中")
+        });
+        recorder.stop();
+        assert_eq!(recorder.status().message, "音声ファイルを保存中");
         for phase in [RecorderPhase::Finished, RecorderPhase::Failed] {
             update(&status, |status| {
                 status.phase = phase;
@@ -1587,6 +1613,70 @@ mod tests {
         }
         assert!(directory.path().join("000001.complete.json").is_file());
         Ok(())
+    }
+
+    fn verify_periodic_output(format: OutputFormat, ffmpeg_path: PathBuf) -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let channels = vec![1, 2];
+        let config = Config {
+            format,
+            ffmpeg_path,
+            checkpoint_secs: 1.0,
+            timing: crate::editor::TimingConfig {
+                segment_secs: 2.0,
+                split_silence_secs: 0.5,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let mut spool = Spool::create(&directory.path().join("processed"), channels.clone())?;
+        let mut output = Output::new(config, directory.path().into(), channels)?;
+        let tracks = [vec![0.25; RATE as usize], vec![0.5; 2 * RATE as usize]];
+        for second in 0..6 {
+            spool.append(&tracks)?;
+            let state = if second < 3 {
+                SpeechState::Unknown
+            } else {
+                SpeechState::Speech
+            };
+            let actions = output.editor.push(second * RATE, RATE, state)?;
+            output.apply(actions, &mut spool)?;
+            spool.discard_before(output.settled)?;
+        }
+        let verify_segment = |number: u64, frames: u64| -> Result<()> {
+            let manifest: serde_json::Value = serde_json::from_slice(&fs::read(
+                directory.path().join(format!("{number:06}.complete.json")),
+            )?)?;
+            assert_eq!(manifest["frames"], frames);
+            assert_eq!(manifest["channels"], json!([1, 2]));
+            Ok(())
+        };
+        output.finalizer.wait()?;
+        assert_eq!(output.finalizer.snapshot().saved, 2);
+        verify_segment(1, 5 * RATE / 2)?;
+        verify_segment(2, 5 * RATE / 2)?;
+        assert!(!directory.path().join("000003.complete.json").exists());
+        let actions = output.editor.finish();
+        output.apply(actions, &mut spool)?;
+        output.finalizer.wait()?;
+        assert_eq!(output.finalizer.snapshot().saved, 3);
+        verify_segment(3, RATE)?;
+        assert_eq!(output.saved_frames, 6 * RATE);
+        Ok(())
+    }
+
+    #[test]
+    fn periodic_wav_segments_are_saved_before_stop() -> Result<()> {
+        verify_periodic_output(OutputFormat::Wav, PathBuf::from("missing"))
+    }
+
+    #[test]
+    #[ignore = "FFmpeg が必要。録音中の M4A 分割・確定を検証"]
+    fn periodic_m4a_segments_are_saved_before_stop() -> Result<()> {
+        let ffmpeg = std::env::var_os("TALKRECORDER_FFMPEG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("runtime/ffmpeg/bin/ffmpeg.exe"));
+        verify_periodic_output(OutputFormat::M4a, ffmpeg)
     }
 
     #[test]

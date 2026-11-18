@@ -29,7 +29,7 @@ impl Default for TimingConfig {
 impl TimingConfig {
     pub fn validate(&self) -> Result<()> {
         for (name, value, allow_zero) in [
-            ("分割基準時間", self.segment_secs, false),
+            ("分割間隔", self.segment_secs, false),
             ("分割用の非発話時間", self.split_silence_secs, false),
             ("非発話を残す長さ", self.keep_silence_secs, true),
             ("会話なし除外時間", self.discard_silence_secs, false),
@@ -68,6 +68,7 @@ struct Boundary {
 pub struct Editor {
     segment_frames: u64,
     split_silence_frames: u64,
+    split_grace_frames: u64,
     discard_frames: u64,
     head_frames: u64,
     tail_frames: u64,
@@ -99,6 +100,7 @@ impl Editor {
         Ok(Self {
             segment_frames: frames(timing.segment_secs, true)?,
             split_silence_frames: frames(timing.split_silence_secs, true)?,
+            split_grace_frames: frames(timing.split_silence_secs.min(10.0), true)?,
             discard_frames: frames(timing.discard_silence_secs, true)?,
             head_frames: keep / 2,
             tail_frames: keep - keep / 2,
@@ -128,7 +130,7 @@ impl Editor {
         let mut actions = Vec::new();
         if state == SpeechState::Silence {
             let silence_start = *self.silence_start.get_or_insert(start);
-            self.schedule_boundaries(silence_start, end);
+            self.schedule_silence_boundaries(silence_start, end);
             let head_end = silence_start.saturating_add(self.head_frames).min(end);
             if self.settled_until < head_end {
                 self.emit_range(head_end, true, &mut actions);
@@ -140,7 +142,18 @@ impl Editor {
         } else {
             // Unknown は保持し、当該セグメントを自動削除できなくする。
             self.flush_silence(start, &mut actions);
-            self.segment_has_signal = true;
+            // 除外判定を待っていた非発話の直後なら、新しい音声の先頭で区切る。
+            if start >= self.split_deadline() && start > self.segment_start {
+                self.schedule_split(start);
+            }
+            while self.segment_start < end {
+                self.segment_has_signal = true;
+                let at = self.split_deadline();
+                if at > end || at <= self.segment_start {
+                    break;
+                }
+                self.schedule_split(at);
+            }
             self.emit_range(end, true, &mut actions);
         }
         self.input_until = end;
@@ -165,7 +178,22 @@ impl Editor {
         actions
     }
 
-    fn schedule_boundaries(&mut self, silence_start: u64, end: u64) {
+    fn split_deadline(&self) -> u64 {
+        self.segment_start
+            .saturating_add(self.segment_frames)
+            .saturating_add(self.split_grace_frames)
+    }
+
+    fn schedule_split(&mut self, at: u64) {
+        self.boundaries.push_back(Boundary {
+            at,
+            discard: !self.segment_has_signal && at - self.segment_start >= self.discard_frames,
+        });
+        self.segment_start = at;
+        self.segment_has_signal = false;
+    }
+
+    fn schedule_silence_boundaries(&mut self, silence_start: u64, end: u64) {
         loop {
             // 会話のない短いファイルを先に公開して、後から削除し直すことを
             // 避ける。全非発話の場合だけ除外判定時間まで確定を待つ。
@@ -174,19 +202,17 @@ impl Editor {
             } else {
                 self.segment_frames.max(self.discard_frames)
             };
-            let at = self
+            let mut at = self
                 .segment_start
                 .saturating_add(min_segment)
                 .max(silence_start.saturating_add(self.split_silence_frames));
+            if self.segment_has_signal {
+                at = at.min(self.split_deadline());
+            }
             if at > end || at <= self.segment_start {
                 break;
             }
-            self.boundaries.push_back(Boundary {
-                at,
-                discard: !self.segment_has_signal && at - self.segment_start >= self.discard_frames,
-            });
-            self.segment_start = at;
-            self.segment_has_signal = false;
+            self.schedule_split(at);
         }
     }
 
@@ -289,16 +315,31 @@ mod tests {
     }
 
     #[test]
-    fn split_waits_for_ten_seconds_after_speech_and_uses_real_time() {
+    fn qualifying_silence_within_grace_uses_its_natural_boundary() {
         let mut editor = Editor::new(timing(), 10).unwrap();
-        let mut actions = editor.push(0, 6_200, SpeechState::Speech).unwrap();
-        actions.extend(editor.push(6_200, 300, SpeechState::Silence).unwrap());
+        let mut actions = editor.push(0, 5_980, SpeechState::Speech).unwrap();
+        actions.extend(editor.push(5_980, 300, SpeechState::Silence).unwrap());
         actions.extend(editor.finish());
         assert!(actions.contains(&EditAction::Split {
-            at: 6_300,
+            at: 6_080,
             discard: false
         }));
-        assert_eq!(ranges(&actions), (6_230, 270));
+        assert_eq!(ranges(&actions), (6_010, 270));
+    }
+
+    #[test]
+    fn recent_silence_cannot_extend_a_segment_past_the_deadline() {
+        let mut config = timing();
+        config.split_silence_secs = 60.0;
+        let mut editor = Editor::new(config, 10).unwrap();
+        let mut actions = editor.push(0, 6_050, SpeechState::Speech).unwrap();
+        actions.extend(editor.push(6_050, 100, SpeechState::Silence).unwrap());
+        assert!(actions.contains(&EditAction::Split {
+            at: 6_100,
+            discard: false
+        }));
+        actions.extend(editor.finish());
+        assert_eq!(ranges(&actions), (6_080, 70));
     }
 
     #[test]
@@ -348,16 +389,34 @@ mod tests {
     }
 
     #[test]
-    fn unknown_is_not_trimmed() {
-        let mut editor = Editor::new(timing(), 10).unwrap();
-        let mut actions = editor.push(0, 12_000, SpeechState::Unknown).unwrap();
-        actions.extend(editor.finish());
-        assert_eq!(ranges(&actions), (12_000, 0));
-        assert!(
-            actions
-                .iter()
-                .all(|a| !matches!(a, EditAction::Split { discard: true, .. }))
-        );
+    fn continuous_speech_or_unknown_is_split_without_losing_samples() {
+        for state in [SpeechState::Speech, SpeechState::Unknown] {
+            let mut editor = Editor::new(timing(), 10).unwrap();
+            let actions = editor.push(0, 12_200, state).unwrap();
+            assert_eq!(
+                actions,
+                [
+                    EditAction::Keep {
+                        start: 0,
+                        end: 6_100
+                    },
+                    EditAction::Split {
+                        at: 6_100,
+                        discard: false
+                    },
+                    EditAction::Keep {
+                        start: 6_100,
+                        end: 12_200
+                    },
+                    EditAction::Split {
+                        at: 12_200,
+                        discard: false
+                    },
+                ]
+            );
+            assert_eq!(ranges(&actions), (12_200, 0));
+            assert!(editor.finish().is_empty());
+        }
     }
 
     #[test]

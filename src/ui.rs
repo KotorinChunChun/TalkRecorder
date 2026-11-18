@@ -581,7 +581,7 @@ impl App {
                     "保存先の空き容量がこの値以下になると録音を停止します。0は無効です。",
                 );
                 ui.end_row();
-                seconds(ui, "分割基準", &mut self.config.timing.segment_secs);
+                seconds(ui, "分割間隔", &mut self.config.timing.segment_secs);
                 seconds(
                     ui,
                     "分割用の共通非発話",
@@ -870,8 +870,13 @@ impl eframe::App for App {
                     {
                         self.recording_requested = true;
                     }
-                } else if ui.button("停止").clicked()
-                    && let Some(r) = &self.recorder
+                } else if let Some(r) = &self.recorder
+                    && ui
+                        .add_enabled(
+                            r.phase_reader()() != RecorderPhase::Finalizing,
+                            egui::Button::new("停止"),
+                        )
+                        .clicked()
                 {
                     r.stop();
                 }
@@ -953,7 +958,7 @@ impl eframe::App for App {
                 let s = r.status();
                 ui.label(&s.message);
                 ui.label(format!(
-                    "{} {:.1} 秒　保存 {:.1} 秒　処理待ち {:.1} 秒",
+                    "{} {:.1} 秒　編集後 {:.1} 秒　解析待ち {:.1} 秒",
                     if s.phase == RecorderPhase::Preview {
                         "入力確認"
                     } else {
@@ -963,7 +968,28 @@ impl eframe::App for App {
                     s.saved_secs,
                     s.pending_secs
                 ));
-                if let Some(path) = s.folder {
+                if let Some(path) = &s.folder {
+                    let progress = s.save_progress();
+                    ui.horizontal_wrapped(|ui| {
+                        if let Some(active) = progress.active {
+                            let stage = match active.parts {
+                                None => "保存準備中".into(),
+                                Some((done, total)) if done < total => {
+                                    format!("書き出し中（内部ファイル {done}/{total}）")
+                                }
+                                Some(_) => "ファイル確定・検証中".into(),
+                            };
+                            ui.label(format!("区間 {:06} {stage}", active.number));
+                        }
+                        ui.label(format!("保存待ち {} 区間", progress.queued));
+                        ui.label(format!("保存済み {} 区間", progress.saved));
+                        if progress.skipped > 0 {
+                            ui.label(format!("除外 {} 区間", progress.skipped));
+                        }
+                        if progress.failed > 0 {
+                            ui.label(format!("保存失敗 {} 区間", progress.failed));
+                        }
+                    });
                     ui.label(path.display().to_string());
                 }
             } else {

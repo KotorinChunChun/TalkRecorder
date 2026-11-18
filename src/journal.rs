@@ -229,9 +229,29 @@ impl JournalWriter {
         self.prepared = Some(discard);
         Ok(())
     }
-    pub fn finish(mut self, source_until: u64, discard: bool) -> Result<()> {
+    pub(crate) fn number(&self) -> u64 {
+        self.state.number
+    }
+    pub fn finish(self, source_until: u64, discard: bool) -> Result<()> {
+        self.finish_with_progress(source_until, discard, |_, _| {})
+            .map(|_| ())
+    }
+
+    pub(crate) fn finish_with_progress(
+        mut self,
+        source_until: u64,
+        discard: bool,
+        progress: impl FnMut(u64, u64),
+    ) -> Result<bool> {
         self.prepare_finish(source_until, discard)?;
-        finalize_journal(&self.session, self.state.number, &self.ffmpeg, discard)
+        finalize_journal_with_progress(
+            &self.session,
+            self.state.number,
+            &self.ffmpeg,
+            discard,
+            progress,
+        )?;
+        Ok(!discard && self.state.frames > 0)
     }
 }
 
@@ -359,6 +379,16 @@ fn part_metadata(dir: &Path, index: u64, state: &JournalState) -> Result<Part> {
 }
 
 pub fn finalize_journal(session: &Path, number: u64, ffmpeg: &Path, discard: bool) -> Result<()> {
+    finalize_journal_with_progress(session, number, ffmpeg, discard, |_, _| {})
+}
+
+fn finalize_journal_with_progress(
+    session: &Path,
+    number: u64,
+    ffmpeg: &Path,
+    discard: bool,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<()> {
     let mut state = load_state(session, number)?.context("内部確定記録がありません")?;
     let dir = journal_dir(session, number);
     if state.published {
@@ -401,6 +431,7 @@ pub fn finalize_journal(session: &Path, number: u64, ffmpeg: &Path, discard: boo
             ffmpeg,
         )?;
         let mut total = 0u64;
+        progress(0, state.parts);
         for index in 1..=state.parts {
             let part = part_metadata(&dir, index, &state)?;
             let mut decoders = state
@@ -433,6 +464,7 @@ pub fn finalize_journal(session: &Path, number: u64, ffmpeg: &Path, discard: boo
             total = total
                 .checked_add(part.frames)
                 .context("内部音声の長さが上限を超えました")?;
+            progress(index, state.parts);
         }
         ensure!(total == state.frames, "内部音声の合計尺が一致しません");
         writer.finish(false)?;
@@ -1032,7 +1064,10 @@ mod tests {
     #[test]
     #[ignore = "固定 FFmpeg が必要。内部 FLAC から Opus/FLAC/M4A への結合を検証"]
     fn lossless_parts_merge_to_requested_codec_with_exact_frames() -> Result<()> {
-        let ffmpeg = Path::new("runtime/ffmpeg/bin/ffmpeg.exe");
+        let ffmpeg = std::env::var_os("TALKRECORDER_FFMPEG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("runtime/ffmpeg/bin/ffmpeg.exe"));
+        let ffmpeg = ffmpeg.as_path();
         for format in [OutputFormat::Flac, OutputFormat::Opus, OutputFormat::M4a] {
             let directory = tempfile::tempdir()?;
             let mut journal = JournalWriter::new(directory.path(), 1, vec![1, 2], format, ffmpeg)?;
@@ -1042,7 +1077,12 @@ mod tests {
             journal.checkpoint(59_259)?;
             let state = load_state(directory.path(), 1)?.unwrap();
             assert_eq!(state.internal_format, OutputFormat::Flac);
-            journal.finish(59_259, false)?;
+            let mut progress = Vec::new();
+            assert!(
+                journal.finish_with_progress(59_259, false, |done, total| progress
+                    .push((done, total)))?
+            );
+            assert_eq!(progress, [(0, 2), (1, 2), (2, 2)]);
             if format == OutputFormat::M4a {
                 let mut published = load_state(directory.path(), 1)?.unwrap();
                 assert!(published.published);
