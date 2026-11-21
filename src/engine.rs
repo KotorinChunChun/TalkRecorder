@@ -1814,8 +1814,10 @@ mod tests {
                 },
             ]
         );
-        let mut timing = crate::editor::TimingConfig::default();
-        timing.keep_silence_secs = 0.0;
+        let timing = crate::editor::TimingConfig {
+            keep_silence_secs: 0.0,
+            ..Default::default()
+        };
         let mut editor = Editor::new(timing, RATE as u32)?;
         let mut at = 0;
         let mut edits = Vec::new();

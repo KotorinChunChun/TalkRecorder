@@ -1,6 +1,6 @@
 # TalkRecorder 開発ガイド
 
-Windows 11、PowerShell 7、Rust 1.88 以上の MSVC ツールチェーン、Visual Studio の C++ ビルドツールと Windows SDK を使用します。以下のコマンドは TalkRecorder のルートで実行します。
+Windows 11、PowerShell 7、Rust 1.89 以上の MSVC ツールチェーン、Visual Studio の C++ ビルドツールと Windows SDK を使用します。以下のコマンドは TalkRecorder のルートで実行します。
 
 ## 起動と配布用ビルド
 

@@ -854,7 +854,7 @@ impl eframe::App for App {
                     if let Err(e) = result {
                         eprintln!("{e:#}");
                         self.exit = true;
-                    } else if self.page < 2 {
+                    } else if self.page < 3 {
                         self.page += 1;
                         self.smoke_frames = 0;
                     } else {

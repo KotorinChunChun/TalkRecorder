@@ -25,11 +25,11 @@ macro_rules! counters {
         }
         const COLUMNS: &[&str] = &[$(stringify!($field)),+];
         impl Counters {
-            fn bind(self) -> impl Iterator<Item = Value> {
-                [$(Value::Integer(self.$field as i64)),+].into_iter()
+            fn bind(self) -> Result<impl Iterator<Item = Value>> {
+                Ok([$(Value::Integer(i64::try_from(self.$field)?)),+].into_iter())
             }
             fn read(row: &Row<'_>) -> rusqlite::Result<Self> {
-                Ok(Self { $($field: row.get(stringify!($field))?,)+ })
+                Ok(Self { $($field: read_counter(row, stringify!($field))?,)+ })
             }
         }
     };
@@ -49,6 +49,12 @@ counters!(
     save_failures,
     recording_failures,
 );
+
+fn read_counter(row: &Row<'_>, column: &str) -> rusqlite::Result<u64> {
+    let index = row.as_ref().column_index(column)?;
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum EventKind {
@@ -240,7 +246,7 @@ fn store(db: &mut Connection, batch: &[Event], archive_on: Option<NaiveDate>) ->
                 Value::Text(event.kind.as_str().into()),
             ];
             insert.execute(params_from_iter(
-                key.into_iter().chain(event.counters.bind()),
+                key.into_iter().chain(event.counters.bind()?),
             ))?;
         }
     }
