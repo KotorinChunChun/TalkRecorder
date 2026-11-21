@@ -978,6 +978,9 @@ impl eframe::App for App {
             if let Some(r) = &self.recorder {
                 let s = r.status();
                 ui.label(&s.message);
+                if let Some(warning) = s.audit_warning() {
+                    ui.label(warning);
+                }
                 ui.label(format!(
                     "{} {:.1} 秒　編集後 {:.1} 秒　解析待ち {:.1} 秒",
                     if s.phase == RecorderPhase::Preview {

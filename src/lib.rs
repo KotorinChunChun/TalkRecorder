@@ -1,4 +1,5 @@
 pub mod analysis_recovery;
+pub mod audit;
 pub mod capture;
 pub mod clock_sync;
 pub mod compact;

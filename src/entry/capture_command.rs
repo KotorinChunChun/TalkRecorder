@@ -111,6 +111,7 @@ fn write_status(output: &mut impl Write, status: &Status, preview: bool) -> Resu
         "edited_secs": status.saved_secs,
         "analysis_pending_secs": status.pending_secs,
         "save": status.save_progress(),
+        "audit_warning": status.audit_warning(),
         "folder": status.folder,
         "tracks": tracks,
     });

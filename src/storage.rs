@@ -96,7 +96,8 @@ impl Spool {
             })
             .collect()
     }
-    pub fn discard_before(&self, frame: u64) -> Result<()> {
+    pub fn discard_before(&self, frame: u64) -> Result<u64> {
+        let mut bytes = 0;
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -105,10 +106,12 @@ impl Spool {
             if base.is_some_and(|base| base + 48000 <= frame)
                 && (name.ends_with(".pcm") || name.ends_with(".json"))
             {
+                let removed = entry.metadata().map_or(0, |metadata| metadata.len());
                 fs::remove_file(entry.path())?;
+                bytes += removed;
             }
         }
-        Ok(())
+        Ok(bytes)
     }
 }
 

@@ -17,6 +17,7 @@ target/
 /dev/handover/
 /dev/history/*/logs/
 *.log
+talkrecorder-audit.sqlite3*
 *.partial
 *.wav
 *.m4a

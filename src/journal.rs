@@ -242,16 +242,16 @@ impl JournalWriter {
         source_until: u64,
         discard: bool,
         progress: impl FnMut(u64, u64),
-    ) -> Result<bool> {
+    ) -> Result<(bool, u64)> {
         self.prepare_finish(source_until, discard)?;
-        finalize_journal_with_progress(
+        let reclaimed = finalize_journal_with_progress(
             &self.session,
             self.state.number,
             &self.ffmpeg,
             discard,
             progress,
         )?;
-        Ok(!discard && self.state.frames > 0)
+        Ok((!discard && self.state.frames > 0, reclaimed))
     }
 }
 
@@ -379,7 +379,7 @@ fn part_metadata(dir: &Path, index: u64, state: &JournalState) -> Result<Part> {
 }
 
 pub fn finalize_journal(session: &Path, number: u64, ffmpeg: &Path, discard: bool) -> Result<()> {
-    finalize_journal_with_progress(session, number, ffmpeg, discard, |_, _| {})
+    finalize_journal_with_progress(session, number, ffmpeg, discard, |_, _| {}).map(|_| ())
 }
 
 fn finalize_journal_with_progress(
@@ -388,19 +388,17 @@ fn finalize_journal_with_progress(
     ffmpeg: &Path,
     discard: bool,
     mut progress: impl FnMut(u64, u64),
-) -> Result<()> {
+) -> Result<u64> {
     let mut state = load_state(session, number)?.context("内部確定記録がありません")?;
     let dir = journal_dir(session, number);
     if state.published {
-        cleanup_parts(&dir, &state)?;
-        return Ok(());
+        return cleanup_parts(&dir, &state);
     }
     let _lock = exclusive_open(&dir.join("finalize.lock"))?;
     // ロック待ちの間に別処理が完了した可能性を再確認。
     state = load_state(session, number)?.context("内部確定記録がありません")?;
     if state.published {
-        cleanup_parts(&dir, &state)?;
-        return Ok(());
+        return cleanup_parts(&dir, &state);
     }
     // 除外の意図も音声削除より先に確定する。再起動時に非発話を復活させない。
     let intent_path = dir.join("intent.json");
@@ -480,8 +478,7 @@ fn finalize_journal_with_progress(
         fs::remove_file(abandoned)?;
     }
     persist_state(&dir, &mut state)?;
-    cleanup_parts(&dir, &state)?;
-    Ok(())
+    cleanup_parts(&dir, &state)
 }
 
 fn exclusive_open(path: &Path) -> Result<File> {
@@ -572,28 +569,30 @@ fn prepare_public(session: &Path, dir: &Path, state: &JournalState) -> Result<()
     Ok(())
 }
 
-fn cleanup_parts(dir: &Path, state: &JournalState) -> Result<()> {
+fn cleanup_parts(dir: &Path, state: &JournalState) -> Result<u64> {
+    let mut bytes = 0;
+    let mut reclaim = |path: PathBuf| -> Result<()> {
+        if let Ok(metadata) = path.metadata() {
+            fs::remove_file(path)?;
+            bytes += metadata.len();
+        }
+        Ok(())
+    };
     for index in 1..=state.parts {
         for i in 0..state.channels.len() {
             let path = part_path(dir, index, i, state.internal_format);
-            if path.exists() {
-                fs::remove_file(path)?;
-            }
+            reclaim(path)?;
         }
         for suffix in ["complete.json", "part.json"] {
             let path = dir.join(format!("{index:06}.{suffix}"));
-            if path.exists() {
-                fs::remove_file(path)?;
-            }
+            reclaim(path)?;
         }
         for i in 0..state.channels.len() {
             let path = dir.join(format!("{index:06}_track{}.encoder.log", i + 1));
-            if path.exists() {
-                fs::remove_file(path)?;
-            }
+            reclaim(path)?;
         }
     }
-    Ok(())
+    Ok(bytes)
 }
 
 #[derive(Debug, Default)]
@@ -1079,8 +1078,10 @@ mod tests {
             assert_eq!(state.internal_format, OutputFormat::Flac);
             let mut progress = Vec::new();
             assert!(
-                journal.finish_with_progress(59_259, false, |done, total| progress
-                    .push((done, total)))?
+                journal
+                    .finish_with_progress(59_259, false, |done, total| progress
+                        .push((done, total)))?
+                    .0
             );
             assert_eq!(progress, [(0, 2), (1, 2), (2, 2)]);
             if format == OutputFormat::M4a {

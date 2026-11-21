@@ -6,6 +6,7 @@ fn print_help() {
          --record --config PATH [--stop-after-secs 秒]\n\
          --preview --config PATH [--stop-after-secs 秒]\n\
          --list-devices\n\
+         --recording-audit [--audit-details] --config PATH\n\
          --write-default-config / --self-check / --check-storage / --recover / --compact-wav --config PATH\n\
          --check-denoise PLUGIN_ID --config PATH\n\
          入力確認と録音は標準入力の stop または Ctrl+C で正常停止します。",
@@ -97,6 +98,13 @@ pub fn run(console: bool) -> anyhow::Result<()> {
         return capture_command::run(path, preview, stop_after);
     }
     let path = specified_path.unwrap_or_else(talk_recorder::ui::config_path_default);
+    if args.iter().any(|arg| arg == "--recording-audit") {
+        let config = talk_recorder::config::Config::load(&path)?;
+        let details = args.iter().any(|arg| arg == "--audit-details");
+        let report = talk_recorder::audit::read_report(&config.output_dir, details)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "--write-default-config") {
         talk_recorder::config::Config::default().save_atomic(&path)?;
         println!("{}", path.display());

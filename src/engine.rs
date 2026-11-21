@@ -19,6 +19,7 @@ use serde_json::json;
 use crate::{
     SpeechState,
     analysis_recovery::ResilientSpeech,
+    audit::{AuditClient, AuditWarning, AuditWorker, Counters, EventKind},
     capture::{self, CaptureEvent, DeviceInfo},
     clock_sync::ClockEstimate,
     config::{Config, OutputFormat},
@@ -140,6 +141,7 @@ pub struct Status {
     pub connected: Vec<bool>,
     pub timing: Vec<Option<ClockEstimate>>,
     pub coverage: Vec<Option<InputCoverage>>,
+    audit_warning: AuditWarning,
 }
 
 impl Default for Status {
@@ -159,11 +161,16 @@ impl Default for Status {
             connected: vec![false; 4],
             timing: vec![None; 4],
             coverage: vec![None; 4],
+            audit_warning: AuditWarning::default(),
         }
     }
 }
 
 impl Status {
+    pub fn audit_warning(&self) -> Option<&'static str> {
+        *self.audit_warning.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn save_progress(&self) -> SaveProgress {
         *self.save_progress.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -579,7 +586,24 @@ fn run(
         update(status, |s| s.message = report.message());
     }
     let _sleep_guard = SleepGuard::new(config.prevent_sleep && !preview)?;
-    let finalizer = Finalizer::new();
+    let audit = if preview {
+        None
+    } else {
+        let warning = status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .audit_warning
+            .clone();
+        match AuditWorker::start(&config.output_dir, warning.clone()) {
+            Ok(worker) => Some(worker),
+            Err(_) => {
+                *warning.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some("録音統計の処理を開始できませんでした");
+                None
+            }
+        }
+    };
+    let finalizer = Finalizer::with_audit(audit.as_ref().map(AuditWorker::client));
     update(status, |s| s.save_progress = finalizer.progress());
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Acquire) {
@@ -610,6 +634,18 @@ fn run(
         }
     });
     let finalized = finalizer.finish();
+    if result.is_err()
+        && let Some(audit) = &audit
+    {
+        audit.client().record(
+            EventKind::RecordingFailure,
+            Counters {
+                recording_failures: 1,
+                ..Counters::default()
+            },
+        );
+    }
+    drop(audit);
     // 現在の録音の確定を優先し、容量停止後に過去WAVの追加変換を始めない。
     let capacity_stopped = status
         .lock()
@@ -1251,6 +1287,11 @@ fn analyze(
 ) -> Result<()> {
     let mut raw = Spool::open(&folder.join("raw"), channels.clone())?;
     let mut processed = Spool::create(&folder.join("processed"), channels.clone())?;
+    let mut capture_audit = CaptureAudit {
+        client: finalizer.audit.clone(),
+        counters: Counters::default(),
+        frames: 0,
+    };
     let mut output =
         Output::with_finalizer(config.clone(), folder.clone(), channels.clone(), finalizer)?;
     let mut next = 0;
@@ -1393,10 +1434,22 @@ fn analyze(
         for interval in intervals {
             let actions = output.editor.push(start, interval.frames, interval.state)?;
             output.apply(actions, &mut processed)?;
+            if interval.state == SpeechState::Unknown {
+                capture_audit.counters.unknown_frames += interval.frames;
+            }
             start += interval.frames;
         }
-        raw.discard_before(output.committed_source)?;
-        processed.discard_before(output.settled)?;
+        for track in metadata.coverage {
+            capture_audit.counters.missing_track_frames += track.missing_frames as u64;
+            capture_audit.counters.unsynchronized_track_frames +=
+                track.unsynchronized_frames as u64;
+        }
+        capture_audit.counters.reclaimed_bytes += raw.discard_before(output.committed_source)?;
+        capture_audit.counters.reclaimed_bytes += processed.discard_before(output.settled)?;
+        capture_audit.frames += frames;
+        if capture_audit.frames >= 60 * RATE {
+            capture_audit.flush();
+        }
         next += frames;
         progress.settled.store(output.settled, Ordering::Release);
         progress
@@ -1433,12 +1486,13 @@ fn analyze(
     } else {
         output.committed_source
     };
-    raw.discard_before(released)?;
-    processed.discard_before(if output.settled >= next {
-        output.settled.div_ceil(RATE).saturating_mul(RATE)
-    } else {
-        output.settled
-    })?;
+    capture_audit.counters.reclaimed_bytes += raw.discard_before(released)?;
+    capture_audit.counters.reclaimed_bytes +=
+        processed.discard_before(if output.settled >= next {
+            output.settled.div_ceil(RATE).saturating_mul(RATE)
+        } else {
+            output.settled
+        })?;
     output.timeline.sync_all()?;
     progress
         .committed
@@ -1448,6 +1502,29 @@ fn analyze(
         status.pending_secs = 0.0;
     });
     Ok(())
+}
+
+struct CaptureAudit {
+    client: Option<AuditClient>,
+    counters: Counters,
+    frames: u64,
+}
+
+impl CaptureAudit {
+    fn flush(&mut self) {
+        if let Some(client) = &self.client
+            && (self.frames > 0 || self.counters.reclaimed_bytes > 0)
+        {
+            client.record(EventKind::Capture, std::mem::take(&mut self.counters));
+            self.frames = 0;
+        }
+    }
+}
+
+impl Drop for CaptureAudit {
+    fn drop(&mut self) {
+        self.flush();
+    }
 }
 
 fn aggregate_states(states: &[SpeechState]) -> SpeechState {
@@ -1471,6 +1548,7 @@ struct Output {
     #[cfg(test)]
     local_finalizer: Option<Finalizer>,
     number: u64,
+    segment_start: u64,
     segment_frames: u64,
     saved_frames: u64,
     settled: u64,
@@ -1505,6 +1583,7 @@ impl Output {
             #[cfg(test)]
             local_finalizer: None,
             number: 1,
+            segment_start: 0,
             segment_frames: 0,
             saved_frames: 0,
             settled: 0,
@@ -1559,7 +1638,27 @@ impl Output {
                         .expect("内部保存")
                         .prepare_finish(at, discard)?;
                     if let Some(writer) = self.writer.take() {
-                        self.finalizer.submit(writer, at, discard)?;
+                        let recorded_frames = at - self.segment_start;
+                        self.finalizer.submit_segment(
+                            writer,
+                            at,
+                            discard,
+                            if discard {
+                                Counters {
+                                    recorded_frames,
+                                    excluded_frames: recorded_frames,
+                                    ..Counters::default()
+                                }
+                            } else {
+                                Counters {
+                                    recorded_frames,
+                                    saved_frames: self.segment_frames,
+                                    silence_cut_frames: recorded_frames - self.segment_frames,
+                                    ..Counters::default()
+                                }
+                            },
+                        )?;
+                        self.segment_start = at;
                     }
                     if discard {
                         self.saved_frames -= self.segment_frames;

@@ -1,5 +1,8 @@
 //! 内部確定済み音声の結合を、取得・解析から独立して実行する。
-use crate::journal::JournalWriter;
+use crate::{
+    audit::{AuditClient, Counters, EventKind},
+    journal::JournalWriter,
+};
 use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use std::{
@@ -16,6 +19,7 @@ struct Job {
     writer: JournalWriter,
     source_until: u64,
     discard: bool,
+    counters: Counters,
     _session_lock: Option<Arc<crate::recovery::SessionLock>>,
     #[cfg(test)]
     pause: Option<std::sync::mpsc::Receiver<()>>,
@@ -53,6 +57,7 @@ pub struct FinalizerClient {
     closed: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     lifecycle: Arc<Mutex<()>>,
+    pub(crate) audit: Option<AuditClient>,
 }
 impl FinalizerClient {
     pub fn with_session_lock(mut self, lock: Arc<crate::recovery::SessionLock>) -> Self {
@@ -60,10 +65,20 @@ impl FinalizerClient {
         self
     }
     pub fn submit(&self, writer: JournalWriter, source_until: u64, discard: bool) -> Result<()> {
+        self.submit_segment(writer, source_until, discard, Counters::default())
+    }
+    pub(crate) fn submit_segment(
+        &self,
+        writer: JournalWriter,
+        source_until: u64,
+        discard: bool,
+        counters: Counters,
+    ) -> Result<()> {
         self.enqueue(Job {
             writer,
             source_until,
             discard,
+            counters,
             _session_lock: self.session_lock.clone(),
             #[cfg(test)]
             pause: None,
@@ -134,6 +149,9 @@ impl Default for Finalizer {
 }
 impl Finalizer {
     pub fn new() -> Self {
+        Self::with_audit(None)
+    }
+    pub(crate) fn with_audit(audit: Option<AuditClient>) -> Self {
         let (sender, receiver) = mpsc::sync_channel::<Option<Job>>(2);
         let progress = SharedSaveProgress::default();
         let error = Arc::new(Mutex::new(None));
@@ -142,6 +160,7 @@ impl Finalizer {
         let closed = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
         let worker_alive = alive.clone();
+        let worker_audit = audit.clone();
         let handle = thread::spawn(move || {
             let _alive = WorkerExit(worker_alive);
             while let Ok(Some(job)) = receiver.recv() {
@@ -174,12 +193,29 @@ impl Finalizer {
                     let mut first = fault.lock().unwrap_or_else(|e| e.into_inner());
                     first.get_or_insert_with(|| format!("{error:#}"));
                 }
+                if let Some(audit) = &worker_audit {
+                    let mut counts = job.counters;
+                    match &result {
+                        Ok((saved, reclaimed)) => {
+                            counts.reclaimed_bytes = *reclaimed;
+                            counts.saved_segments = u64::from(*saved);
+                            counts.excluded_segments = u64::from(job.discard);
+                        }
+                        Err(_) => {
+                            counts.saved_frames = 0;
+                            counts.silence_cut_frames = 0;
+                            counts.excluded_frames = 0;
+                            counts.save_failures = 1;
+                        }
+                    }
+                    audit.record(EventKind::Segment, counts);
+                }
                 drop(job._session_lock);
                 let mut progress = worker_progress.lock().unwrap_or_else(|e| e.into_inner());
                 progress.active = None;
                 match result {
-                    Ok(true) => progress.saved += 1,
-                    Ok(false) => progress.skipped += 1,
+                    Ok((true, _)) => progress.saved += 1,
+                    Ok((false, _)) => progress.skipped += 1,
                     Err(_) => progress.failed += 1,
                 }
             }
@@ -193,6 +229,7 @@ impl Finalizer {
                 closed,
                 alive,
                 lifecycle: Arc::new(Mutex::new(())),
+                audit,
             }),
             handle: Some(handle),
         }
@@ -337,6 +374,7 @@ mod tests {
             progress: SharedSaveProgress::default(),
             error: Arc::new(Mutex::new(None)),
             session_lock: None,
+            audit: None,
             closed: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(true)),
             lifecycle: Arc::new(Mutex::new(())),
@@ -403,6 +441,7 @@ mod tests {
             writer: prepared(directory.path(), 1)?,
             source_until: 100,
             discard: false,
+            counters: Counters::default(),
             _session_lock: client.session_lock.clone(),
             pause: Some(gate),
         })?;
@@ -425,6 +464,7 @@ mod tests {
             writer: prepared(directory.path(), 1)?,
             source_until: 100,
             discard: false,
+            counters: Counters::default(),
             _session_lock: None,
             pause: Some(gate),
         })?;
@@ -457,6 +497,7 @@ mod tests {
             writer: prepared(directory.path(), 1)?,
             source_until: 100,
             discard: false,
+            counters: Counters::default(),
             _session_lock: None,
             pause: Some(gate),
         })?;
