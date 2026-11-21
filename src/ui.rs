@@ -520,18 +520,8 @@ impl App {
                     Stroke::new(1.0_f32, Color32::DARK_GRAY),
                 );
                 if wave.len() > 1 {
-                    let points: Vec<_> = wave
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &v)| {
-                            egui::pos2(
-                                rect.left() + rect.width() * i as f32 / (wave.len() - 1) as f32,
-                                rect.center().y - v.clamp(-1., 1.) * rect.height() * 0.45,
-                            )
-                        })
-                        .collect();
                     painter.add(egui::Shape::line(
-                        points,
+                        waveform_points(rect, wave),
                         Stroke::new(if is_recording { 1.6_f32 } else { 1.3_f32 }, if is_recording {
                             Color32::from_rgb(94, 238, 185)
                         } else {
@@ -686,6 +676,26 @@ impl App {
         });
     }
 }
+fn waveform_points(rect: egui::Rect, wave: &[f32]) -> Vec<egui::Pos2> {
+    const DEFAULT_LIMIT: f32 = 1.0 / 3.0;
+    // 大きいピークが表示範囲にある間だけ倍率を抑える。
+    let limit = wave
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(DEFAULT_LIMIT, f32::max);
+    let x_step = rect.width() / (wave.len() - 1) as f32;
+    let half_height = rect.height() * 0.45;
+    wave.iter()
+        .enumerate()
+        .map(|(index, &sample)| {
+            egui::pos2(
+                rect.left() + x_step * index as f32,
+                rect.center().y - (sample / limit) * half_height,
+            )
+        })
+        .collect()
+}
+
 fn seconds(ui: &mut egui::Ui, label: &str, value: &mut f64) {
     ui.label(label);
     ui.add(
@@ -1108,6 +1118,22 @@ pub fn config_path_default() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waveform_uses_triple_gain_except_while_a_loud_peak_is_visible() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let center = rect.center().y;
+        let quiet = 0.1;
+        let quiet_points = waveform_points(rect, &[0.0, quiet]);
+        assert!((center - quiet_points[1].y - quiet * 45.0 * 3.0).abs() < 1e-4);
+        for peak in [-0.8_f32, 0.8] {
+            let loud_points = waveform_points(rect, &[peak, quiet]);
+            assert!((loud_points[0].y - (center - peak.signum() * 45.0)).abs() < 1e-4);
+            assert!(loud_points[1].y > quiet_points[1].y);
+            assert_eq!(loud_points[1].x, rect.right());
+        }
+        assert_eq!(waveform_points(rect, &[0.0, quiet]), quiet_points);
+    }
 
     #[test]
     fn remembered_missing_device_is_distinct_from_unselected_and_never_rebound_by_name() {
