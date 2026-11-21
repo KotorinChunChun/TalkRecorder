@@ -130,6 +130,8 @@ pub struct Analysis {
     pub transcript: Option<String>,
     /// 当該バッチの先頭からの相対時刻。過去文脈の時刻は除外・クランプする。
     pub segments: Vec<TranscriptSegment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub window_states: Vec<SpeechState>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -143,6 +145,8 @@ enum Request {
         channels: u16,
         samples: Vec<f32>,
         denoise: DenoiseMode,
+        #[serde(default)]
+        window_states: bool,
     },
 }
 #[derive(Serialize, Deserialize)]
@@ -410,7 +414,7 @@ impl SpeechClient {
                 && checked.insert(id.to_owned())
             {
                 let response = self.exchange_cancellable(&Request::Process {
-                    track:0, sample_rate:48_000, channels:1, samples:vec![0.0;72_000], denoise:mode.clone()
+                    track:0, sample_rate:48_000, channels:1, samples:vec![0.0;72_000], denoise:mode.clone(), window_states:false,
                 }, timeout, Some(cancel))
                     .with_context(|| format!("ノイズ除去プラグインの動作確認に失敗しました: {id}。処理負荷・配置を確認するか、別の方式を選択してください"))?;
                 match response {
@@ -449,6 +453,28 @@ impl SpeechClient {
         denoise: DenoiseMode,
         timeout: Duration,
     ) -> Result<Analysis> {
+        self.process_block(
+            track,
+            sample_rate,
+            channels,
+            samples,
+            denoise,
+            timeout,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn process_block(
+        &mut self,
+        track: usize,
+        sample_rate: u32,
+        channels: u16,
+        samples: &[f32],
+        denoise: DenoiseMode,
+        timeout: Duration,
+        window_states: bool,
+    ) -> Result<Analysis> {
         ensure!(
             !timeout.is_zero(),
             "音声解析の応答期限は0秒より大きくしてください"
@@ -461,6 +487,7 @@ impl SpeechClient {
                 channels,
                 samples: samples.to_vec(),
                 denoise,
+                window_states,
             },
             timeout,
         )?;
@@ -468,7 +495,11 @@ impl SpeechClient {
             Response::Analyzed(analysis) => {
                 ensure!(
                     analysis.samples.len() == samples.len()
-                        && analysis.samples.iter().all(|v| v.is_finite()),
+                        && analysis.samples.iter().all(|v| v.is_finite())
+                        && (!window_states
+                            || analysis.window_states.len()
+                                == (samples.len() / usize::from(channels))
+                                    .div_ceil(crate::sync_audio::ANALYSIS_WINDOW_FRAMES)),
                     "音声処理後のサンプル数または値が不正です"
                 );
                 Ok(analysis)
@@ -534,12 +565,20 @@ pub fn run_worker() -> Result<()> {
                 channels,
                 samples,
                 denoise,
+                window_states,
             }) => {
                 match engine
                     .as_mut()
                     .context("音声ランタイムが初期化されていません")
                     .and_then(|engine| {
-                        engine.process(track, sample_rate, channels, &samples, denoise)
+                        engine.process(
+                            track,
+                            sample_rate,
+                            channels,
+                            &samples,
+                            denoise,
+                            window_states,
+                        )
                     }) {
                     Ok(analysis) => Response::Analyzed(analysis),
                     Err(error) => Response::Error(format!("{error:#}")),
@@ -837,10 +876,26 @@ impl Engine {
         channels: u16,
         input: &[f32],
         denoise: DenoiseMode,
+        split_state: bool,
     ) -> Result<Analysis> {
         validate_audio(rate, channels, input)?;
         ensure!(track < 4, "解析トラック番号が範囲外です");
         let frames = input.len() / channels as usize;
+        let window_frames = crate::sync_audio::ANALYSIS_WINDOW_FRAMES;
+        let mut window_states = Vec::new();
+        if split_state {
+            ensure!(
+                rate == 48_000 && frames <= 48_000,
+                "区間判定は48kHzの1秒以内です"
+            );
+            window_states.extend((0..frames).step_by(window_frames).map(|start| {
+                if frames - start >= window_frames {
+                    SpeechState::Silence
+                } else {
+                    SpeechState::Unknown
+                }
+            }));
+        }
         let mut context = self.tracks.remove(&track).unwrap_or_default();
         if context.rate != rate || context.channels != channels {
             context = TrackContext {
@@ -875,11 +930,24 @@ impl Engine {
             };
             let regions = self.detect(&window, rate, self.settings.min_speech_secs)?;
             let confirmed = regions.iter().any(overlap);
-            let candidate = if confirmed {
-                true
+            let candidates = if !confirmed || split_state {
+                self.detect(&window, rate, 0.0)?
             } else {
-                self.detect(&window, rate, 0.0)?.iter().any(overlap)
+                Vec::new()
             };
+            let candidate = confirmed || candidates.iter().any(overlap);
+            for (index, state) in window_states.iter_mut().enumerate() {
+                let start = offset_secs + (index * window_frames) as f64 / f64::from(rate);
+                let end = offset_secs
+                    + ((index + 1) * window_frames).min(frames) as f64 / f64::from(rate);
+                let overlaps_window =
+                    |region: &TranscriptSegment| region.end_secs > start && region.start_secs < end;
+                if regions.iter().any(overlaps_window) {
+                    *state = SpeechState::Speech;
+                } else if *state == SpeechState::Silence && candidates.iter().any(overlaps_window) {
+                    *state = SpeechState::Unknown;
+                }
+            }
             if confirmed {
                 state = SpeechState::Speech;
             } else if state != SpeechState::Speech && candidate {
@@ -896,6 +964,8 @@ impl Engine {
                 let text = c_string(unsafe { (self.native.text)(result) });
                 if !text.trim().is_empty() {
                     state = SpeechState::Speech;
+                    // Haas が発話を補足した場合は保守的にこの入力全体を残す。
+                    window_states.fill(SpeechState::Speech);
                     transcript = Some(text);
                     for region in self.native.regions(&request)?.into_iter().filter(overlap) {
                         segments.push(TranscriptSegment {
@@ -945,6 +1015,7 @@ impl Engine {
             samples: output,
             transcript,
             segments,
+            window_states,
         })
     }
 }
@@ -1187,7 +1258,9 @@ mod tests {
         let mut speech_batches = 0;
         let batches = audio.chunks(rate as usize).count();
         for batch in audio.chunks(rate as usize) {
-            let analysis = engine.process(0, rate, 1, batch, DenoiseMode::Off).unwrap();
+            let analysis = engine
+                .process(0, rate, 1, batch, DenoiseMode::Off, false)
+                .unwrap();
             assert_eq!(analysis.samples.len(), batch.len());
             if analysis.state == SpeechState::Speech {
                 speech_batches += 1;
@@ -1207,7 +1280,7 @@ mod tests {
             let start = rate as usize * 2;
             let end = start + rate as usize * milliseconds / 1000;
             let analysis = engine
-                .process(0, rate, 1, &audio[start..end], DenoiseMode::Off)
+                .process(0, rate, 1, &audio[start..end], DenoiseMode::Off, false)
                 .unwrap();
             assert_ne!(
                 analysis.state,
@@ -1224,9 +1297,10 @@ mod tests {
         let input = vec![0.0; 48_000 * 2];
         for _ in 0..10 {
             let analysis = engine
-                .process(0, 48_000, 2, &input, DenoiseMode::Off)
+                .process(0, 48_000, 2, &input, DenoiseMode::Off, true)
                 .unwrap();
             assert_eq!(analysis.state, SpeechState::Silence);
+            assert_eq!(analysis.window_states, vec![SpeechState::Silence; 4]);
             assert_eq!(analysis.samples, input);
         }
         assert!(
@@ -1249,7 +1323,7 @@ mod tests {
             // 逆相の左右を混ぜると消えるため、左右別 VAD の回帰確認も兼ねる。
             let stereo: Vec<f32> = mono.iter().flat_map(|sample| [*sample, -*sample]).collect();
             let result = engine
-                .process(0, rate, 2, &stereo, DenoiseMode::Reuse)
+                .process(0, rate, 2, &stereo, DenoiseMode::Reuse, false)
                 .unwrap();
             assert_eq!(result.samples.len(), stereo.len());
             assert!(result.samples.iter().all(|sample| sample.is_finite()));
@@ -1269,7 +1343,9 @@ mod tests {
         };
         let mut engine = Engine::load(settings).unwrap();
         let input = &audio[rate as usize..rate as usize * 4];
-        let result = engine.process(0, rate, 1, input, DenoiseMode::Off).unwrap();
+        let result = engine
+            .process(0, rate, 1, input, DenoiseMode::Off, false)
+            .unwrap();
         assert_eq!(result.samples, input);
         assert_eq!(result.state, SpeechState::Speech);
         for segment in &result.segments {
@@ -1289,7 +1365,7 @@ mod tests {
         }
         assert!(
             engine
-                .process(0, rate, 1, &[f32::NAN], DenoiseMode::Off)
+                .process(0, rate, 1, &[f32::NAN], DenoiseMode::Off, false)
                 .is_err()
         );
         eprintln!(

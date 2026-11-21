@@ -88,6 +88,12 @@ fn round_trip_duration(format: OutputFormat, extension: &str, frames: usize) {
     assert_eq!(manifest["frames"].as_u64(), Some(frames as u64));
     assert_eq!(manifest["format"], serde_json::to_value(format).unwrap());
     for (track, &count) in channels.iter().enumerate() {
+        assert!(
+            !destination
+                .path()
+                .join(format!("000001_track{}.encoder.log", track + 1))
+                .exists()
+        );
         let path = destination
             .path()
             .join(format!("000001_track{}.{extension}", track + 1));

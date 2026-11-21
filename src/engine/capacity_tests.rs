@@ -153,7 +153,14 @@ fn stopped_recording_keeps_buffered_audio(mode: StopMode, format: OutputFormat) 
             &status,
         )?;
     }
-    append_aligned(&mut aligner, &mut raw, RATE as usize, &progress)?;
+    append_aligned(
+        &mut aligner,
+        &mut raw,
+        RATE as usize,
+        &progress,
+        &slots,
+        &status,
+    )?;
     let (sender, receiver) = mpsc::sync_channel(8);
     for (track, &channel_count) in channels.iter().enumerate() {
         sender.send(packet(

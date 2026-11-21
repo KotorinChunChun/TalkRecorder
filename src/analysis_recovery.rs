@@ -141,10 +141,11 @@ impl ResilientSpeech {
         channels: u16,
         samples: &[f32],
         mode: DenoiseMode,
+        window_states: bool,
     ) -> Result<Option<Analysis>> {
         let timeout = self.timeout;
         self.state.call(|client| {
-            client.process_with_timeout(track, rate, channels, samples, mode, timeout)
+            client.process_block(track, rate, channels, samples, mode, timeout, window_states)
         })
     }
 }

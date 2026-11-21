@@ -31,7 +31,7 @@ use crate::{
     recovery::SessionLock,
     speech::SpeechClient,
     storage::{Spool, check_encoder},
-    sync_audio::Aligner,
+    sync_audio::{ANALYSIS_WINDOW_FRAMES, Aligner, InputCoverage},
 };
 
 const RATE: u64 = 48_000;
@@ -139,6 +139,7 @@ pub struct Status {
     pub speech: Vec<SpeechState>,
     pub connected: Vec<bool>,
     pub timing: Vec<Option<ClockEstimate>>,
+    pub coverage: Vec<Option<InputCoverage>>,
 }
 
 impl Default for Status {
@@ -157,6 +158,7 @@ impl Default for Status {
             speech: vec![SpeechState::Unknown; 4],
             connected: vec![false; 4],
             timing: vec![None; 4],
+            coverage: vec![None; 4],
         }
     }
 }
@@ -511,6 +513,43 @@ impl Progress {
 struct BlockMetadata {
     frames: u64,
     valid: Vec<bool>,
+    coverage: Vec<InputCoverage>,
+    valid_windows: Vec<Vec<bool>>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct SpeechInterval {
+    frames: u64,
+    state: SpeechState,
+}
+
+impl BlockMetadata {
+    fn speech_intervals(
+        &self,
+        states: &[SpeechState],
+        track_windows: &[Vec<SpeechState>],
+    ) -> Vec<SpeechInterval> {
+        let mut intervals: Vec<SpeechInterval> = Vec::new();
+        let mut remaining = self.frames;
+        for window in 0..(self.frames as usize).div_ceil(ANALYSIS_WINDOW_FRAMES) {
+            let mut window_states = [SpeechState::Unknown; 4];
+            for (index, &state) in states.iter().enumerate() {
+                if self.valid_windows[index][window] {
+                    window_states[index] =
+                        track_windows[index].get(window).copied().unwrap_or(state);
+                }
+            }
+            let state = aggregate_states(&window_states[..states.len()]);
+            let frames = remaining.min(ANALYSIS_WINDOW_FRAMES as u64);
+            remaining -= frames;
+            if let Some(last) = intervals.last_mut().filter(|last| last.state == state) {
+                last.frames += frames;
+            } else {
+                intervals.push(SpeechInterval { frames, state });
+            }
+        }
+        intervals
+    }
 }
 
 fn run(
@@ -695,6 +734,7 @@ fn run_session(
         for (index, &slot) in slots.iter().enumerate() {
             s.connected[slot] = ready[index];
             s.timing[slot] = None;
+            s.coverage[slot] = None;
         }
     });
     if requested.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
@@ -986,7 +1026,7 @@ fn acquire(
         }
         let available = source_frames(origin).saturating_sub(CAPTURE_LAG);
         while spool.frames + RATE <= available {
-            append_aligned(aligner, spool, RATE as usize, progress)?;
+            append_aligned(aligner, spool, RATE as usize, progress, slots, status)?;
             if let Err(error) = check_backlog(config, progress, &spool.channels) {
                 failure.get_or_insert(error);
                 stop.store(true, Ordering::Release);
@@ -1025,7 +1065,7 @@ fn flush_capture(
     }
     while spool.frames < end {
         let frames = (end - spool.frames).min(RATE) as usize;
-        append_aligned(aligner, spool, frames, progress)?;
+        append_aligned(aligner, spool, frames, progress, slots, status)?;
     }
     failure.map_or(Ok(()), Err)
 }
@@ -1055,21 +1095,10 @@ fn ingest(
             .get(*track)
             .context("時刻診断のトラック番号が不正です")?;
         update(status, |s| s.timing[slot] = Some(*estimate));
-        let folder = status
-            .lock()
-            .map_err(|_| anyhow!("状態のロックに失敗しました"))?
-            .folder
-            .clone();
-        if let Some(folder) = folder {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(folder.join("capture-timing.jsonl"))?;
-            log(
-                &mut file,
-                json!({"event":"clock_sync","slot":slot,"received_qpc_100ns":received_qpc_100ns,"device_frame":device_frame,"packet_frames":packet_frames,"raw_qpc_100ns":raw_qpc_100ns,"estimate":estimate}),
-            )?;
-        }
+        log_capture(
+            status,
+            json!({"event":"clock_sync","slot":slot,"received_qpc_100ns":received_qpc_100ns,"device_frame":device_frame,"packet_frames":packet_frames,"raw_qpc_100ns":raw_qpc_100ns,"estimate":estimate}),
+        )?;
         return Ok(());
     }
     if let CaptureEvent::Connection {
@@ -1083,6 +1112,7 @@ fn ingest(
             s.connected[slot] = *connected;
             if !connected {
                 s.speech[slot] = SpeechState::Unknown;
+                s.timing[slot] = None;
             }
             s.message = if slots.iter().any(|&slot| !s.connected[slot]) {
                 format!("録音継続・再接続待ち: {message}")
@@ -1090,9 +1120,29 @@ fn ingest(
                 "録音中".into()
             };
         });
+        log_capture(
+            status,
+            json!({"event":"connection","slot":slot,"connected":connected,"observed_qpc_100ns":capture::qpc_100ns(),"observed_at":chrono::Local::now().to_rfc3339(),"message":message}),
+        )?;
     }
     update_wave(&event, config.preview_secs, slots, status);
     aligner.ingest(event)
+}
+
+fn log_capture(status: &SharedStatus, event: serde_json::Value) -> Result<()> {
+    let folder = status
+        .lock()
+        .map_err(|_| anyhow!("状態のロックに失敗しました"))?
+        .folder
+        .clone();
+    if let Some(folder) = folder {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(folder.join("capture-timing.jsonl"))?;
+        log(&mut file, event)?;
+    }
+    Ok(())
 }
 
 fn append_aligned(
@@ -1100,6 +1150,8 @@ fn append_aligned(
     spool: &mut Spool,
     frames: usize,
     progress: &Progress,
+    slots: &[usize],
+    status: &SharedStatus,
 ) -> Result<()> {
     let start = spool.frames;
     let block = aligner.take(start, frames)?;
@@ -1107,11 +1159,18 @@ fn append_aligned(
     let metadata = BlockMetadata {
         frames: frames as u64,
         valid: block.valid,
+        coverage: block.coverage,
+        valid_windows: block.valid_windows,
     };
     fs::write(
         spool.dir.join(format!("{start:020}_valid.json")),
         serde_json::to_vec(&metadata)?,
     )?;
+    update(status, |s| {
+        for (&slot, coverage) in slots.iter().zip(metadata.coverage) {
+            s.coverage[slot] = Some(coverage);
+        }
+    });
     progress.produced.store(spool.frames, Ordering::Release);
     Ok(())
 }
@@ -1224,24 +1283,58 @@ fn analyze(
         let frames = (produced - next).min(RATE);
         let metadata: BlockMetadata =
             serde_json::from_slice(&fs::read(raw.dir.join(format!("{next:020}_valid.json")))?)?;
+        let window_count = (frames as usize).div_ceil(ANALYSIS_WINDOW_FRAMES);
         ensure!(
-            metadata.frames == frames && metadata.valid.len() == channels.len(),
+            metadata.frames == frames
+                && metadata.valid.len() == channels.len()
+                && metadata.coverage.len() == channels.len()
+                && metadata.valid_windows.len() == channels.len()
+                && metadata
+                    .valid_windows
+                    .iter()
+                    .all(|windows| windows.len() == window_count),
             "一時音声の確定情報が不正です"
         );
         let mut tracks = raw.read(next, next + frames)?;
         let mut states = vec![SpeechState::Unknown; channels.len()];
+        let mut track_windows = vec![Vec::new(); channels.len()];
+        let split_state = metadata.valid.contains(&false);
         let overloaded = (produced - next) as f64 > config.max_pending_secs * RATE as f64 / 2.0;
         let mut analysis_wait = overloaded;
         if !overloaded {
             for index in 0..channels.len() {
-                if !metadata.valid[index] {
+                let windows = &metadata.valid_windows[index];
+                if !windows.contains(&true) {
                     continue;
                 }
                 let mode = config.tracks[slots[index]].denoise.clone();
-                match speech.process(index, RATE as u32, channels[index], &tracks[index], mode) {
+                match speech.process(
+                    index,
+                    RATE as u32,
+                    channels[index],
+                    &tracks[index],
+                    mode,
+                    split_state,
+                ) {
                     Ok(Some(analysis)) => {
                         states[index] = analysis.state;
-                        tracks[index] = analysis.samples;
+                        track_windows[index] = analysis.window_states;
+                        if metadata.valid[index] {
+                            tracks[index] = analysis.samples;
+                        } else {
+                            // 解析要求は従来どおり毎秒1回。同期未確定の音声には加工を適用しない。
+                            let window_samples =
+                                ANALYSIS_WINDOW_FRAMES * usize::from(channels[index]);
+                            for ((original, enhanced), &valid) in tracks[index]
+                                .chunks_mut(window_samples)
+                                .zip(analysis.samples.chunks(window_samples))
+                                .zip(windows)
+                            {
+                                if valid {
+                                    original.copy_from_slice(enhanced);
+                                }
+                            }
+                        }
                         if analysis.transcript.is_some() {
                             log(
                                 &mut output.timeline,
@@ -1252,6 +1345,7 @@ fn analyze(
                     Ok(None) => {
                         analysis_wait = true;
                         states.fill(SpeechState::Unknown);
+                        track_windows.iter_mut().for_each(Vec::clear);
                         tracks = raw.read(next, next + frames)?;
                         break;
                     }
@@ -1265,6 +1359,7 @@ fn analyze(
                         )?;
                         analysis_wait = true;
                         states.fill(SpeechState::Unknown);
+                        track_windows.iter_mut().for_each(Vec::clear);
                         // 一部だけ除去処理済みにしない。原音一式で当該区間を残す。
                         tracks = raw.read(next, next + frames)?;
                         break;
@@ -1273,19 +1368,33 @@ fn analyze(
             }
         }
         processed.append(&tracks)?;
-        let state = aggregate_states(&states);
-        log(
-            &mut output.timeline,
-            json!({"event":"speech_state","source_start":next,"frames":frames,"slots":&slots,"timestamp_coverage_valid":&metadata.valid,"states":&states,"aggregate":state}),
-        )?;
-        if metadata.valid.iter().any(|valid| !valid) || states.contains(&SpeechState::Unknown) {
-            log(
-                &mut output.timeline,
-                json!({"event":"uncertain_audio","source_start":next,"frames":frames,"slots":&slots,"timestamp_coverage_valid":&metadata.valid,"states":&states}),
-            )?;
+        let intervals = metadata.speech_intervals(&states, &track_windows);
+        // 表示上の「非発話」は、対象トラックの全区間を判定できた場合に限る。
+        for (state, &valid) in states.iter_mut().zip(&metadata.valid) {
+            if *state == SpeechState::Silence && !valid {
+                *state = SpeechState::Unknown;
+            }
         }
-        let actions = output.editor.push(next, frames, state)?;
-        output.apply(actions, &mut processed)?;
+        let mut event = json!({"event":"speech_state","source_start":next,"frames":frames,"slots":&slots,"timestamp_coverage_valid":&metadata.valid,"states":&states,"aggregate":aggregate_states(&states)});
+        if split_state {
+            event["coverage"] = json!(metadata.coverage);
+            event["valid_windows"] = json!(metadata.valid_windows);
+            if intervals.len() > 1 {
+                event["intervals"] = json!(intervals);
+            } else {
+                event["aggregate"] = json!(intervals[0].state);
+            }
+        }
+        if analysis_wait {
+            event["analysis_deferred"] = json!(if overloaded { "backlog" } else { "worker" });
+        }
+        log(&mut output.timeline, event)?;
+        let mut start = next;
+        for interval in intervals {
+            let actions = output.editor.push(start, interval.frames, interval.state)?;
+            output.apply(actions, &mut processed)?;
+            start += interval.frames;
+        }
         raw.discard_before(output.committed_source)?;
         processed.discard_before(output.settled)?;
         next += frames;
@@ -1516,6 +1625,77 @@ fn create_session_folder(base: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::config::OutputFormat;
+
+    #[test]
+    fn a_gap_only_protects_its_window_across_all_tracks() -> Result<()> {
+        let block = BlockMetadata {
+            frames: RATE,
+            valid: vec![false, true],
+            coverage: vec![],
+            valid_windows: vec![vec![true, false, true, true], vec![true; 4]],
+        };
+        let intervals = block.speech_intervals(
+            &[SpeechState::Speech, SpeechState::Silence],
+            &[
+                vec![
+                    SpeechState::Silence,
+                    SpeechState::Speech,
+                    SpeechState::Silence,
+                    SpeechState::Silence,
+                ],
+                vec![],
+            ],
+        );
+        assert_eq!(
+            intervals,
+            vec![
+                SpeechInterval {
+                    frames: 12_000,
+                    state: SpeechState::Silence
+                },
+                SpeechInterval {
+                    frames: 12_000,
+                    state: SpeechState::Unknown
+                },
+                SpeechInterval {
+                    frames: 24_000,
+                    state: SpeechState::Silence
+                },
+            ]
+        );
+        let mut timing = crate::editor::TimingConfig::default();
+        timing.keep_silence_secs = 0.0;
+        let mut editor = Editor::new(timing, RATE as u32)?;
+        let mut at = 0;
+        let mut edits = Vec::new();
+        for interval in intervals {
+            edits.extend(editor.push(at, interval.frames, interval.state)?);
+            at += interval.frames;
+        }
+        edits.extend(editor.finish());
+        assert_eq!(
+            edits[0],
+            EditAction::Cut {
+                start: 0,
+                end: 12_000
+            }
+        );
+        assert_eq!(
+            edits[1],
+            EditAction::Keep {
+                start: 12_000,
+                end: 24_000
+            }
+        );
+        assert_eq!(
+            edits[2],
+            EditAction::Cut {
+                start: 24_000,
+                end: RATE
+            }
+        );
+        Ok(())
+    }
 
     #[test]
     fn phase_reader_tracks_changes_and_stop_does_not_overwrite_saving_or_terminal_state() {

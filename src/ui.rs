@@ -462,6 +462,27 @@ impl App {
                             SpeechState::Silence => "非発話",
                             SpeechState::Unknown => "未判定",
                         });
+                        if track.enabled && let Some(s) = status {
+                            if !s.connected[index] && s.running {
+                                ui.label("デバイス再接続待ち");
+                            } else if let Some(coverage) = s.coverage[index] {
+                                let total = coverage.synchronized_frames
+                                    + coverage.unsynchronized_frames
+                                    + coverage.missing_frames;
+                                if coverage.missing_frames == total {
+                                    ui.label("入力途絶");
+                                } else if coverage.missing_frames > 0 || coverage.unsynchronized_frames > 0 {
+                                    ui.label(if coverage.unsynchronized_frames > 0 {
+                                        "入力あり・同期未確定"
+                                    } else {
+                                        "入力に欠損あり"
+                                    }).on_hover_text(format!(
+                                        "直近の {} フレーム中、未取得 {}・同期未確定 {}",
+                                        total, coverage.missing_frames, coverage.unsynchronized_frames
+                                    ));
+                                }
+                            }
+                        }
                     } else if track.enabled && !track.device_id.is_empty() {
                         let has_input = status.is_some_and(|s| {
                             s.waves.get(index).is_some_and(|wave| !wave.is_empty())

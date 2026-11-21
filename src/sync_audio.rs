@@ -2,10 +2,38 @@
 
 use crate::capture::CaptureEvent;
 use anyhow::{Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 const OUTPUT_RATE: f64 = 48_000.0;
 const MAX_PROVISIONAL_SPEEDUP: f64 = 0.005;
+pub(crate) const ANALYSIS_WINDOW_FRAMES: usize = 12_000;
+// 0.25 ms at 48 kHz. Used only between packets whose device frames are contiguous.
+const MAX_CLOCK_JITTER_FRAMES: f64 = 12.0;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputCoverage {
+    pub synchronized_frames: usize,
+    pub unsynchronized_frames: usize,
+    pub missing_frames: usize,
+}
+
+#[derive(Clone, Copy)]
+enum FrameCoverage {
+    Synchronized,
+    Unsynchronized,
+    Missing,
+}
+
+impl FrameCoverage {
+    fn received(synchronized: bool) -> Self {
+        if synchronized {
+            Self::Synchronized
+        } else {
+            Self::Unsynchronized
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct AlignedBlock {
@@ -13,6 +41,8 @@ pub struct AlignedBlock {
     pub tracks: Vec<Vec<f32>>,
     /// False if any output frame in a track is missing or has unreliable timing.
     pub valid: Vec<bool>,
+    pub coverage: Vec<InputCoverage>,
+    pub valid_windows: Vec<Vec<bool>>,
 }
 
 #[derive(Debug)]
@@ -21,6 +51,7 @@ struct Packet {
     output_step: f64,
     samples: Vec<f32>,
     valid: bool,
+    follows_previous: bool,
 }
 
 impl Packet {
@@ -239,6 +270,7 @@ impl Aligner {
             output_step,
             samples,
             valid: placement_valid && !discontinuity,
+            follows_previous: stream.last_device_end == Some(device_frame),
         };
         let end = packet.end(stream.channels);
         ensure!(
@@ -285,12 +317,15 @@ impl Aligner {
             .ok_or_else(|| anyhow::anyhow!("音声のサンプル位置が上限を超えました"))?;
         let mut tracks = Vec::with_capacity(self.tracks.len());
         let mut valid = Vec::with_capacity(self.tracks.len());
+        let mut coverage = Vec::with_capacity(self.tracks.len());
+        let mut valid_windows = Vec::with_capacity(self.tracks.len());
         for stream in &mut self.tracks {
             let sample_count = frames
                 .checked_mul(stream.channels)
                 .ok_or_else(|| anyhow::anyhow!("音声バッファが大きすぎます"))?;
             let mut output = vec![0.0; sample_count];
-            let mut complete = true;
+            let mut counts = InputCoverage::default();
+            let mut windows = vec![true; frames.div_ceil(ANALYSIS_WINDOW_FRAMES)];
             for offset in 0..frames {
                 let position = start as f64 + offset as f64;
                 // Keep only the packet that can cover this position and future
@@ -300,32 +335,39 @@ impl Aligner {
                 }
                 let frame_output =
                     &mut output[offset * stream.channels..(offset + 1) * stream.channels];
-                if !interpolate(stream, position, frame_output) {
-                    complete = false;
+                match interpolate(stream, position, frame_output) {
+                    FrameCoverage::Synchronized => {
+                        counts.synchronized_frames += 1;
+                        continue;
+                    }
+                    FrameCoverage::Unsynchronized => counts.unsynchronized_frames += 1,
+                    FrameCoverage::Missing => counts.missing_frames += 1,
                 }
+                windows[offset / ANALYSIS_WINDOW_FRAMES] = false;
             }
-            while stream
-                .packets
-                .front()
-                .is_some_and(|packet| packet.end(stream.channels) <= end as f64)
-            {
-                stream.packets.pop_front();
-            }
+            // Retain one preceding packet for interpolation across a block boundary.
             tracks.push(output);
-            valid.push(complete);
+            valid.push(counts.synchronized_frames == frames);
+            coverage.push(counts);
+            valid_windows.push(windows);
         }
         self.cursor = end;
-        Ok(AlignedBlock { tracks, valid })
+        Ok(AlignedBlock {
+            tracks,
+            valid,
+            coverage,
+            valid_windows,
+        })
     }
 }
 
-fn interpolate(stream: &Track, position: f64, output: &mut [f32]) -> bool {
+fn interpolate(stream: &Track, position: f64, output: &mut [f32]) -> FrameCoverage {
     let Some(packet) = stream.packets.front() else {
-        return false;
+        return FrameCoverage::Missing;
     };
     let input_position = (position - packet.start) / packet.output_step;
     if input_position < -1e-7 {
-        return false;
+        return FrameCoverage::Missing;
     }
     let input_position = input_position.max(0.0);
     let count = packet.frames(stream.channels);
@@ -337,13 +379,19 @@ fn interpolate(stream: &Track, position: f64, output: &mut [f32]) -> bool {
             let b = packet.samples[(index + 1) * stream.channels + channel];
             *output_sample = a + (b - a) * mix;
         }
-        return packet.valid;
+        return FrameCoverage::received(packet.valid);
     }
     let last_position = packet.start + (count - 1) as f64 * packet.output_step;
     if let Some(next) = stream.packets.get(1) {
         let distance = next.start - last_position;
+        let max_distance = if packet.valid && next.valid {
+            packet.output_step + MAX_CLOCK_JITTER_FRAMES
+        } else {
+            packet.output_step * 2.5
+        };
         if distance > 0.0
-            && distance <= packet.output_step * 2.5
+            && next.follows_previous
+            && distance <= max_distance
             && position >= last_position
             && position < next.start
         {
@@ -353,16 +401,16 @@ fn interpolate(stream: &Track, position: f64, output: &mut [f32]) -> bool {
                 let b = next.samples[channel];
                 *output_sample = a + (b - a) * mix;
             }
-            return packet.valid && next.valid;
+            return FrameCoverage::received(packet.valid && next.valid);
         }
     }
     if input_position < count as f64 {
         // At a final packet's sub-sample edge there is no future sample yet.
         // Hold that last sample; never synthesize a whole missing frame interval.
         output.copy_from_slice(&packet.samples[(count - 1) * stream.channels..]);
-        return packet.valid;
+        return FrameCoverage::received(packet.valid);
     }
-    false
+    FrameCoverage::Missing
 }
 
 #[cfg(test)]
@@ -443,6 +491,44 @@ mod tests {
             discontinuity: false,
             timestamp_valid: true,
         }
+    }
+
+    #[test]
+    fn small_clock_jitter_between_contiguous_packets_does_not_make_a_gap() {
+        let mut aligner = Aligner::new(0, vec![1], 2.0).unwrap();
+        aligner
+            .ingest(packet(0, 48_000, 0, 0, vec![0.25; 480]))
+            .unwrap();
+        aligner
+            .ingest(packet(0, 48_000, 480, 100_833, vec![0.75; 480]))
+            .unwrap();
+        assert!(aligner.take(0, 480).unwrap().valid[0]);
+        let next = aligner.take(480, 480).unwrap();
+        assert!(next.valid[0]);
+        assert!((0.25..0.75).contains(&next.tracks[0][0]));
+    }
+
+    #[test]
+    fn coverage_distinguishes_missing_frames_from_received_unsynchronized_audio() {
+        let mut aligner = Aligner::new(0, vec![1], 2.0).unwrap();
+        aligner
+            .ingest(packet(0, 48_000, 0, 0, vec![0.25; 12_000]))
+            .unwrap();
+        let mut uncertain = packet(0, 48_000, 12_004, 2_500_833, vec![0.5; 480]);
+        if let CaptureEvent::Packet {
+            timestamp_valid, ..
+        } = &mut uncertain
+        {
+            *timestamp_valid = false;
+        }
+        aligner.ingest(uncertain).unwrap();
+        let block = aligner.take(0, 24_000).unwrap();
+        assert_eq!(block.valid_windows[0], [true, false]);
+        assert_eq!(block.coverage[0].synchronized_frames, 12_000);
+        assert_eq!(block.coverage[0].unsynchronized_frames, 480);
+        assert_eq!(block.coverage[0].missing_frames, 11_520);
+        assert_eq!(block.tracks[0][12_000], 0.5);
+        assert_eq!(block.tracks[0][23_999], 0.0);
     }
 
     #[test]

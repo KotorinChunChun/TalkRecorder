@@ -95,6 +95,8 @@ fn write_status(output: &mut impl Write, status: &Status, preview: bool) -> Resu
             json!({
                 "slot": index + 1,
                 "connected": status.connected[index],
+                "coverage": status.coverage[index],
+                "speech": status.speech[index],
                 "wave_samples": wave.len(),
                 "peak": wave.iter().map(|sample| sample.abs()).fold(0.0, f32::max),
             })
@@ -149,7 +151,30 @@ mod tests {
         assert_eq!(value["tracks"][0]["wave_samples"], 2);
         assert_eq!(value["tracks"][0]["peak"], 0.5);
         assert!(value["folder"].is_null());
+        assert!(value["tracks"][0]["coverage"].is_null());
         assert!(value["tracks"][0].get("wave").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn recording_status_separates_received_unsynchronized_and_missing_frames() -> Result<()> {
+        use talk_recorder::sync_audio::InputCoverage;
+
+        let mut status = Status::default();
+        status.coverage[0] = Some(InputCoverage {
+            synchronized_frames: 47_000,
+            unsynchronized_frames: 800,
+            missing_frames: 200,
+        });
+        let mut encoded = Vec::new();
+        write_status(&mut encoded, &status, false)?;
+        let value: serde_json::Value = serde_json::from_slice(&encoded)?;
+        assert_eq!(
+            value["tracks"][0]["coverage"]["synchronized_frames"],
+            47_000
+        );
+        assert_eq!(value["tracks"][0]["coverage"]["unsynchronized_frames"], 800);
+        assert_eq!(value["tracks"][0]["coverage"]["missing_frames"], 200);
         Ok(())
     }
 }

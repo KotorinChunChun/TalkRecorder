@@ -493,6 +493,17 @@ impl SegmentWriter {
             drop(manifest);
             fs::rename(&temporary, path)?;
         }
+        if self.format != OutputFormat::Wav {
+            for index in 1..=self.channels.len() {
+                let path = self
+                    .dir
+                    .join(format!("{:06}_track{index}.encoder.log", self.number));
+                if path.metadata().is_ok_and(|metadata| metadata.len() == 0) {
+                    // 保存確定後の補助ログの掃除は、録音の確定結果を変更しない。
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
         Ok(())
     }
 }
