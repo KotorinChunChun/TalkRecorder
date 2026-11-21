@@ -1,5 +1,6 @@
 //! 録音取得をモデル推論・圧縮から切り離す、有限バッファの実行パイプライン。
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -37,6 +38,18 @@ use crate::{
 
 const RATE: u64 = 48_000;
 const CAPTURE_LAG: u64 = 14_400;
+const WAVE_POINTS: usize = 2_000;
+const QPC_TICKS_PER_SECOND: u64 = 10_000_000;
+
+#[derive(Debug, Clone, Copy)]
+pub struct WavePoint {
+    pub qpc_100ns: u64,
+    pub amplitude: f32,
+}
+
+pub(crate) fn wave_window_ticks(seconds: f64) -> u64 {
+    ((seconds * QPC_TICKS_PER_SECOND as f64).round() as u64).clamp(1, 600 * QPC_TICKS_PER_SECOND)
+}
 
 #[cfg(test)]
 mod capacity_tests;
@@ -136,7 +149,7 @@ pub struct Status {
     pub pending_secs: f64,
     save_progress: SharedSaveProgress,
     pub folder: Option<PathBuf>,
-    pub waves: Vec<Vec<f32>>,
+    pub waves: Vec<VecDeque<WavePoint>>,
     pub speech: Vec<SpeechState>,
     pub connected: Vec<bool>,
     pub timing: Vec<Option<ClockEstimate>>,
@@ -156,7 +169,7 @@ impl Default for Status {
             pending_secs: 0.0,
             save_progress: SharedSaveProgress::default(),
             folder: None,
-            waves: vec![Vec::new(); 4],
+            waves: vec![VecDeque::new(); 4],
             speech: vec![SpeechState::Unknown; 4],
             connected: vec![false; 4],
             timing: vec![None; 4],
@@ -965,7 +978,13 @@ fn run_preview(
                 }
             }
             Ok(CaptureEvent::Error { track, message }) => bail!("デバイス{}: {message}", track + 1),
-            Ok(event) => update_wave(&event, config.preview_secs, slots, status),
+            Ok(event) => update_wave(
+                &event,
+                config.preview_secs,
+                slots,
+                status,
+                capture::qpc_100ns(),
+            ),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => bail!("入力確認が予期せず終了しました"),
         }
@@ -1161,7 +1180,13 @@ fn ingest(
             json!({"event":"connection","slot":slot,"connected":connected,"observed_qpc_100ns":capture::qpc_100ns(),"observed_at":chrono::Local::now().to_rfc3339(),"message":message}),
         )?;
     }
-    update_wave(&event, config.preview_secs, slots, status);
+    update_wave(
+        &event,
+        config.preview_secs,
+        slots,
+        status,
+        capture::qpc_100ns(),
+    );
     aligner.ingest(event)
 }
 
@@ -1236,12 +1261,20 @@ fn check_backlog(config: &Config, progress: &Progress, channels: &[u16]) -> Resu
     Ok(())
 }
 
-fn update_wave(event: &CaptureEvent, preview_secs: f64, slots: &[usize], status: &SharedStatus) {
+fn update_wave(
+    event: &CaptureEvent,
+    preview_secs: f64,
+    slots: &[usize],
+    status: &SharedStatus,
+    now: u64,
+) {
     let CaptureEvent::Packet {
         track,
         sample_rate,
         channels,
         samples,
+        qpc_100ns,
+        timestamp_valid,
         ..
     } = event
     else {
@@ -1250,26 +1283,45 @@ fn update_wave(event: &CaptureEvent, preview_secs: f64, slots: &[usize], status:
     let Some(&slot) = slots.get(*track) else {
         return;
     };
-    if *channels == 0 {
+    if *channels == 0 || *sample_rate == 0 || samples.is_empty() {
         return;
     }
-    let stride = ((f64::from(*sample_rate) * preview_secs / 2_000.0).ceil() as usize).max(1);
-    let values: Vec<_> = samples
-        .chunks_exact(usize::from(*channels))
-        .step_by(stride)
-        .map(|frame| {
-            frame
+    let rate = u64::from(*sample_rate);
+    let channels = usize::from(*channels);
+    let duration = samples.len() as u64 / channels as u64 * QPC_TICKS_PER_SECOND / rate;
+    let latest_start = now.saturating_sub(duration);
+    let packet_start = if *timestamp_valid {
+        (*qpc_100ns).min(latest_start)
+    } else {
+        latest_start
+    };
+    let window = wave_window_ticks(preview_secs);
+    let bucket = window.div_ceil(WAVE_POINTS as u64);
+    let stride = (bucket * rate).div_ceil(QPC_TICKS_PER_SECOND) as usize;
+    update(status, |status| {
+        let wave = &mut status.waves[slot];
+        for (index, frame) in samples.chunks_exact(channels).enumerate().step_by(stride) {
+            let time = packet_start + index as u64 * QPC_TICKS_PER_SECOND / rate;
+            if wave
+                .back()
+                .is_some_and(|last| last.qpc_100ns / bucket >= time / bucket)
+            {
+                continue;
+            }
+            let amplitude = frame
                 .iter()
                 .copied()
                 .max_by(|a, b| a.abs().total_cmp(&b.abs()))
-                .unwrap_or(0.0)
-        })
-        .collect();
-    update(status, |status| {
-        let wave = &mut status.waves[slot];
-        wave.extend(values);
-        if wave.len() > 2_000 {
-            wave.drain(..wave.len() - 2_000);
+                .unwrap_or(0.0);
+            wave.push_back(WavePoint {
+                qpc_100ns: time,
+                amplitude,
+            });
+        }
+        let cutoff = (packet_start + duration).saturating_sub(window);
+        while wave.front().is_some_and(|point| point.qpc_100ns < cutoff) || wave.len() > WAVE_POINTS
+        {
+            wave.pop_front();
         }
     });
 }
@@ -2228,7 +2280,13 @@ mod tests {
             },
         ])?;
         assert!(status.lock().unwrap().waves[0].is_empty());
-        assert_eq!(status.lock().unwrap().waves[2], [0.2, 0.2]);
+        assert_eq!(
+            status.lock().unwrap().waves[2]
+                .iter()
+                .map(|p| p.amplitude)
+                .collect::<Vec<_>>(),
+            [0.2, 0.2]
+        );
         process(vec![
             CaptureEvent::Connection {
                 track: 0,
@@ -2239,8 +2297,42 @@ mod tests {
         ])?;
         let status = status.lock().unwrap();
         assert!(status.connected[0]);
-        assert_eq!(status.waves[0], [0.3, 0.3]);
+        assert_eq!(
+            status.waves[0]
+                .iter()
+                .map(|p| p.amplitude)
+                .collect::<Vec<_>>(),
+            [0.3, 0.3]
+        );
         Ok(())
+    }
+
+    #[test]
+    fn waveform_sampling_uses_the_time_window_across_short_packets() {
+        let status = Arc::new(Mutex::new(Status::default()));
+        let interval = QPC_TICKS_PER_SECOND / 100;
+        for index in 0..100 {
+            let time = index * interval;
+            update_wave(
+                &CaptureEvent::Packet {
+                    track: 0,
+                    sample_rate: 48_000,
+                    channels: 1,
+                    device_frame: index * 480,
+                    qpc_100ns: time,
+                    samples: vec![0.25; 480],
+                    discontinuity: false,
+                    timestamp_valid: true,
+                },
+                600.0,
+                &[0],
+                &status,
+                time + interval,
+            );
+        }
+        let view = status.lock().unwrap();
+        let times: Vec<_> = view.waves[0].iter().map(|point| point.qpc_100ns).collect();
+        assert_eq!(times, [0, 3_000_000, 6_000_000, 9_000_000]);
     }
 
     #[test]

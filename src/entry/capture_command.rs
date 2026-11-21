@@ -98,7 +98,7 @@ fn write_status(output: &mut impl Write, status: &Status, preview: bool) -> Resu
                 "coverage": status.coverage[index],
                 "speech": status.speech[index],
                 "wave_samples": wave.len(),
-                "peak": wave.iter().map(|sample| sample.abs()).fold(0.0, f32::max),
+                "peak": wave.iter().map(|point| point.amplitude.abs()).fold(0.0, f32::max),
             })
         })
         .collect::<Vec<_>>();
@@ -124,7 +124,7 @@ fn write_status(output: &mut impl Write, status: &Status, preview: bool) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use talk_recorder::engine::RecorderPhase;
+    use talk_recorder::engine::{RecorderPhase, WavePoint};
 
     #[test]
     fn explicit_stop_and_untimed_eof_request_finalization() {
@@ -143,7 +143,12 @@ mod tests {
     fn preview_status_reports_wave_activity_without_pcm() -> Result<()> {
         let mut status = Status::default();
         status.connected[0] = true;
-        status.waves[0] = vec![-0.5, 0.125];
+        status.waves[0] = [-0.5, 0.125]
+            .map(|amplitude| WavePoint {
+                qpc_100ns: 0,
+                amplitude,
+            })
+            .into();
         status.phase = RecorderPhase::Preview;
         let mut encoded = Vec::new();
         write_status(&mut encoded, &status, true)?;

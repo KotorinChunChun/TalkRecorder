@@ -6,7 +6,7 @@ use crate::{
     denoise_plugins::{PluginCatalog, discover_for_current_exe},
     desktop_controls::{DesktopAction, DesktopRequests, menu_action, tray_action},
     device_settings::DeviceSettingsStore,
-    engine::{Recorder, RecorderPhase},
+    engine::{Recorder, RecorderPhase, WavePoint, wave_window_ticks},
     maintenance::{self, MaintenanceReport},
     single_instance::{SingleInstance, acquire_or_notify},
     speech::DenoiseMode,
@@ -411,6 +411,8 @@ impl App {
             .is_some_and(|s| s.phase == RecorderPhase::Recording);
         let preview = self.preview.as_ref().filter(|p| !p.stopping);
         let preview_status = preview.map(|p| p.recorder.status());
+        let now = capture::qpc_100ns();
+        let wave_window = wave_window_ticks(self.config.preview_secs);
         let can_edit = self.can_edit_settings();
         for (index, track) in self.config.tracks.iter_mut().enumerate() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -498,10 +500,6 @@ impl App {
                         }
                     }
                 });
-                let wave = status
-                    .and_then(|s| s.waves.get(index))
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
                 let (rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), 75.),
                     egui::Sense::hover(),
@@ -519,15 +517,18 @@ impl App {
                     ],
                     Stroke::new(1.0_f32, Color32::DARK_GRAY),
                 );
-                if wave.len() > 1 {
-                    painter.add(egui::Shape::line(
-                        waveform_points(rect, wave),
-                        Stroke::new(if is_recording { 1.6_f32 } else { 1.3_f32 }, if is_recording {
+                if let Some(wave) = status.and_then(|s| s.waves.get(index)) {
+                    let points = waveform_points(rect, wave.iter(), now, wave_window);
+                    let stroke = Stroke::new(if is_recording { 1.6_f32 } else { 1.3_f32 }, if is_recording {
                             Color32::from_rgb(94, 238, 185)
                         } else {
                             Color32::from_rgb(104, 150, 144)
-                        }),
-                    ));
+                        });
+                    match points.as_slice() {
+                        [] => {}
+                        [point] => { painter.circle_filled(*point, stroke.width / 2.0, stroke.color); }
+                        _ => { painter.add(egui::Shape::line(points, stroke)); }
+                    }
                 }
             });
         }
@@ -676,20 +677,27 @@ impl App {
         });
     }
 }
-fn waveform_points(rect: egui::Rect, wave: &[f32]) -> Vec<egui::Pos2> {
+fn waveform_points<'a>(
+    rect: egui::Rect,
+    wave: impl Iterator<Item = &'a WavePoint> + Clone,
+    now: u64,
+    window: u64,
+) -> Vec<egui::Pos2> {
     const DEFAULT_LIMIT: f32 = 1.0 / 3.0;
+    let visible = wave.filter_map(|point| {
+        let age = now.checked_sub(point.qpc_100ns)?;
+        (age <= window).then_some((age, point.amplitude))
+    });
     // 大きいピークが表示範囲にある間だけ倍率を抑える。
-    let limit = wave
-        .iter()
-        .map(|sample| sample.abs())
+    let limit = visible
+        .clone()
+        .map(|(_, sample)| sample.abs())
         .fold(DEFAULT_LIMIT, f32::max);
-    let x_step = rect.width() / (wave.len() - 1) as f32;
     let half_height = rect.height() * 0.45;
-    wave.iter()
-        .enumerate()
-        .map(|(index, &sample)| {
+    visible
+        .map(|(age, sample)| {
             egui::pos2(
-                rect.left() + x_step * index as f32,
+                rect.right() - rect.width() * (age as f64 / window as f64) as f32,
                 rect.center().y - (sample / limit) * half_height,
             )
         })
@@ -1124,15 +1132,48 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
         let center = rect.center().y;
         let quiet = 0.1;
-        let quiet_points = waveform_points(rect, &[0.0, quiet]);
+        let draw = |first, first_time| {
+            let wave = [
+                WavePoint {
+                    qpc_100ns: first_time,
+                    amplitude: first,
+                },
+                WavePoint {
+                    qpc_100ns: 20,
+                    amplitude: quiet,
+                },
+            ];
+            waveform_points(rect, wave.iter(), 20, 10)
+        };
+        let quiet_points = draw(0.0, 10);
         assert!((center - quiet_points[1].y - quiet * 45.0 * 3.0).abs() < 1e-4);
         for peak in [-0.8_f32, 0.8] {
-            let loud_points = waveform_points(rect, &[peak, quiet]);
+            let loud_points = draw(peak, 10);
             assert!((loud_points[0].y - (center - peak.signum() * 45.0)).abs() < 1e-4);
             assert!(loud_points[1].y > quiet_points[1].y);
             assert_eq!(loud_points[1].x, rect.right());
         }
-        assert_eq!(waveform_points(rect, &[0.0, quiet]), quiet_points);
+        assert_eq!(draw(0.8, 9), quiet_points[1..]);
+    }
+
+    #[test]
+    fn waveform_history_grows_left_without_changing_the_time_scale() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let wave = [100, 110, 120].map(|qpc_100ns| WavePoint {
+            qpc_100ns,
+            amplitude: 0.0,
+        });
+        let first = waveform_points(rect, wave[..2].iter(), 110, 100);
+        let later = waveform_points(rect, wave.iter(), 120, 100);
+        assert_eq!(
+            first.iter().map(|point| point.x).collect::<Vec<_>>(),
+            [90.0, 100.0]
+        );
+        assert_eq!(
+            later.iter().map(|point| point.x).collect::<Vec<_>>(),
+            [80.0, 90.0, 100.0]
+        );
+        assert!(waveform_points(rect, wave.iter(), 221, 100).is_empty());
     }
 
     #[test]
