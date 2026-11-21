@@ -60,7 +60,10 @@ pub struct Config {
     pub reconnect_secs: f64,
     pub prevent_sleep: bool,
     pub auto_recover: bool,
-    pub auto_record_via_host: bool,
+    // 旧版の設定ファイルを読み込むためだけに受け付ける。
+    #[doc(hidden)]
+    #[serde(rename = "auto_record_via_host", skip_serializing)]
+    pub legacy_auto_record: serde::de::IgnoredAny,
     pub analysis_timeout_secs: f64,
 }
 
@@ -100,7 +103,7 @@ impl Default for Config {
             reconnect_secs: 2.0,
             prevent_sleep: true,
             auto_recover: true,
-            auto_record_via_host: false,
+            legacy_auto_record: serde::de::IgnoredAny,
             analysis_timeout_secs: 10.0,
         }
     }
@@ -273,6 +276,22 @@ mod tests {
         let mut config = Config::default();
         config.tracks[0].device_id = "input-1".into();
         config
+    }
+
+    #[test]
+    fn obsolete_auto_record_setting_is_accepted_and_omitted_on_save() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"auto_record_via_host":false,"preview_secs":12.0}"#,
+        )?;
+        let config = Config::load(&path)?;
+        assert_eq!(config.preview_secs, 12.0);
+        config.save_atomic(&path)?;
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        assert!(saved.get("auto_record_via_host").is_none());
+        Ok(())
     }
 
     #[test]

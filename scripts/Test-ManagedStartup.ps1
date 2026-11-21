@@ -16,7 +16,7 @@ $cfg = Join-Path $run 'settings.json'
 $writer = Start-Process -FilePath $exePath -ArgumentList @('--write-default-config','--config',('"' + $cfg + '"')) -WindowStyle Hidden -Wait -PassThru
 if ($writer.ExitCode -ne 0 -or !(Test-Path -LiteralPath $cfg)) { throw 'テスト設定を生成できません' }
 $settings = Get-Content -LiteralPath $cfg -Raw | ConvertFrom-Json
-if ($settings.auto_record_via_host -ne $false) { throw '新規設定で自動録音が有効です' }
+if ($settings.PSObject.Properties.Name -contains 'auto_record_via_host') { throw '廃止した自動録音設定があります' }
 $settings.auto_recover = $false
 $settings.auto_compact_wav = $false
 $settings.output_dir = Join-Path $run 'unused-recordings'
@@ -84,7 +84,7 @@ function Send-Management([string] $Command, [int] $ExpectedPid = 0) {
     } finally { $pipe.Dispose(); $deadline.Dispose() }
 }
 
-$app = Start-Process -FilePath $exePath -ArgumentList @('--startup','--launch-origin','via_kotorintoys','--config',('"' + $cfg + '"')) -WindowStyle Hidden -PassThru
+$app = Start-Process -FilePath $exePath -ArgumentList @('--startup','--launch-origin','host_manual','--config',('"' + $cfg + '"')) -WindowStyle Hidden -PassThru
 try {
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     $status = $null
@@ -92,7 +92,7 @@ try {
         try { $status = Send-Management status } catch [OperationCanceledException] { }
     } while ($null -eq $status -and [DateTime]::UtcNow -lt $deadline -and !$app.HasExited)
     if ($null -eq $status -or !$status.ready -or $status.protocolVersion -ne 2 -or $status.pid -ne $app.Id -or
-        $status.version -ne $version -or $status.launchOrigin -ne 'via_kotorintoys' -or $status.detail -ne '待機中') {
+        $status.version -ne $version -or $status.launchOrigin -ne 'host_manual' -or $status.detail -ne '待機中') {
         throw '無表示起動後の状態が一致しません'
     }
     Start-Sleep -Milliseconds 800
@@ -108,7 +108,7 @@ try {
     foreach ($attempt in 1..12) {
         $status = Send-Management status
         if (!$status.ready -or $status.result -ne 'completed' -or $status.pid -ne $app.Id -or
-            $status.protocolVersion -ne 2 -or $status.launchOrigin -ne 'via_kotorintoys' -or $status.detail -ne '待機中') {
+            $status.protocolVersion -ne 2 -or $status.launchOrigin -ne 'host_manual' -or $status.detail -ne '待機中') {
             throw "再接続した状態確認（$attempt 回目）が一致しません"
         }
     }
@@ -123,8 +123,8 @@ try {
     if ((Send-Management stop $app.Id).result -ne 'accepted' -or !$app.WaitForExit(10000) -or $app.ExitCode -ne 0) {
         throw '自動起動したプロセスが正常終了しません'
     }
-    if (Test-Path -LiteralPath $settings.output_dir) { throw '自動録音OFFで録音先が作成されました' }
-    '無表示・自動録音OFF・中断後に同じPIDへ12回再接続・表示・正常終了を確認'
+    if (Test-Path -LiteralPath $settings.output_dir) { throw '本体からの手動起動で録音先が作成されました' }
+    '本体からの手動起動時の無表示・待機・中断後に同じPIDへ12回再接続・表示・正常終了を確認'
 } finally {
     if (!$app.HasExited) {
         try { $null = Send-Management stop $app.Id } catch { }

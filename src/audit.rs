@@ -271,28 +271,28 @@ fn store(db: &mut Connection, batch: &[Event], archive_on: Option<NaiveDate>) ->
 }
 
 #[derive(Serialize)]
-struct DaySummary {
-    day: String,
+pub(crate) struct DaySummary {
+    pub(crate) day: String,
     #[serde(flatten)]
-    counters: Counters,
+    pub(crate) counters: Counters,
 }
 
 #[derive(Serialize)]
-struct Detail {
-    day: String,
-    utc_ms: i64,
-    kind: String,
+pub(crate) struct Detail {
+    pub(crate) day: String,
+    pub(crate) utc_ms: i64,
+    pub(crate) kind: String,
     #[serde(flatten)]
-    counters: Counters,
+    pub(crate) counters: Counters,
 }
 
 #[derive(Serialize)]
 pub struct Report {
-    sample_rate: u32,
-    archived: Vec<DaySummary>,
-    recent: Vec<DaySummary>,
+    pub(crate) sample_rate: u32,
+    pub(crate) archived: Vec<DaySummary>,
+    pub(crate) recent: Vec<DaySummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    details: Option<Vec<Detail>>,
+    pub(crate) details: Option<Vec<Detail>>,
 }
 
 pub fn read_report(dir: &Path, details: bool) -> Result<Report> {

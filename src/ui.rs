@@ -28,6 +28,12 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
 };
 
+mod audit_view;
+
+fn auto_record_on_startup(startup: bool, origin: &str) -> bool {
+    startup && matches!(origin, "via_kotorintoys" | "direct_task")
+}
+
 pub fn run(path: PathBuf, startup: bool, origin: &'static str) -> Result<()> {
     let Some(instance) = acquire_or_notify(!startup)? else {
         return Ok(());
@@ -67,6 +73,7 @@ struct App {
     recording_requested: bool,
     message: String,
     page: usize,
+    audit_view: audit_view::AuditView,
     tray: Option<TrayIcon>,
     tray_monitor: Option<TrayMonitor>,
     hidden: bool,
@@ -199,11 +206,8 @@ impl App {
         if startup && tray.is_none() {
             anyhow::bail!("無表示起動には通知領域の準備が必要です: {message}");
         }
-        let auto_record = startup
-            && origin == "via_kotorintoys"
-            && allow_automatic
-            && config.auto_record_via_host
-            && smoke_dir.is_none();
+        let auto_record =
+            auto_record_on_startup(startup, origin) && allow_automatic && smoke_dir.is_none();
         let recovery = if !auto_record
             && (config.auto_recover || config.auto_compact_wav)
             && smoke_dir.is_none()
@@ -275,6 +279,7 @@ impl App {
             recording_requested: false,
             message,
             page: 0,
+            audit_view: audit_view::AuditView::default(),
             tray,
             tray_monitor,
             hidden: startup,
@@ -631,9 +636,6 @@ impl App {
                 ui.label("起動時自動復旧");
                 ui.checkbox(&mut self.config.auto_recover, "有効");
                 ui.end_row();
-                ui.label("KotorinToys 経由の自動録音");
-                ui.checkbox(&mut self.config.auto_record_via_host, "有効");
-                ui.end_row();
             });
     }
     fn speech_settings(&mut self, ui: &mut egui::Ui) {
@@ -967,7 +969,9 @@ impl eframe::App for App {
                 }
             });
             ui.horizontal(|ui| {
-                for (index, label) in ["デバイス", "保存・時間", "音声処理"].iter().enumerate()
+                for (index, label) in ["デバイス", "保存・時間", "音声処理", "録音ログ"]
+                    .iter()
+                    .enumerate()
                 {
                     ui.selectable_value(&mut self.page, index, *label);
                 }
@@ -1053,6 +1057,10 @@ impl eframe::App for App {
             }
         });
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.page == 3 {
+                self.audit_view.show(ui, &self.config.output_dir);
+                return;
+            }
             egui::ScrollArea::vertical().show(ui, |ui| match self.page {
                 0 => self.devices(ui),
                 1 => {
@@ -1126,6 +1134,17 @@ pub fn config_path_default() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_starts_only_for_reserved_launch_routes() {
+        for origin in ["via_kotorintoys", "direct_task"] {
+            assert!(auto_record_on_startup(true, origin));
+            assert!(!auto_record_on_startup(false, origin));
+        }
+        for origin in ["standalone", "host_manual"] {
+            assert!(!auto_record_on_startup(true, origin));
+        }
+    }
 
     #[test]
     fn waveform_uses_triple_gain_except_while_a_loud_peak_is_visible() {
