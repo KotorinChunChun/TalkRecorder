@@ -7,25 +7,25 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace]
+exclude = ["vendor/libDF"]
 
 [lib]
 name = "talkrecorder_deepfilter"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "7b14b895fe7fc42cab72b4a4c1e49c982bd6404b", default-features = false, features = ["tract"] }
-ndarray = "=0.15.6"
+deep_filter = { path = "vendor/libDF", default-features = false, features = ["tract"] }
 serde_json = "1"
-# Upstream targets tract 0.21.4. Later 0.21 releases changed ndarray and Graph APIs.
-tract-core = "=0.21.4"
-tract-data = "=0.21.4"
-tract-hir = "=0.21.4"
-tract-linalg = "=0.21.4"
-tract-nnef = "=0.21.4"
-tract-onnx = "=0.21.4"
-tract-onnx-opl = "=0.21.4"
-tract-pulse = "=0.21.4"
-tract-pulse-opl = "=0.21.4"
+# tract一式を揃え、上流との差分はvendor/README.mdに記録する。
+tract-core = "=0.21.17"
+tract-data = "=0.21.17"
+tract-hir = "=0.21.17"
+tract-linalg = "=0.21.17"
+tract-nnef = "=0.21.17"
+tract-onnx = "=0.21.17"
+tract-onnx-opl = "=0.21.17"
+tract-pulse = "=0.21.17"
+tract-pulse-opl = "=0.21.17"
 
 [dev-dependencies]
 hound = "=3.5.1"

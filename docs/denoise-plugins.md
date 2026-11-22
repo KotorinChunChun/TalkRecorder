@@ -4,6 +4,8 @@
 
 RNNoise、DeepFilterNet3、RE-USEを、必要なデバイスだけで使用できます。**初期状態は全デバイスで「ノイズ除去なし」です。** プラグインを配置しただけでは読み込まず、録音開始時に、そのデバイスで選択した方式だけを動作させます。
 
+Windows x64でDeepFilterNet3を使う場合は、[v0.1.8の配布ページ](https://github.com/KotorinChunChun/TalkRecorder/releases/tag/v0.1.8)からプラグインのZIPを取得し、TalkRecorderを終了してから `TalkRecorder.exe` と同じフォルダーへ展開します。既に導入している場合は `plugins/deepfilternet3` 内のファイルを置き換えます。再起動後、設定で使うデバイスのノイズ除去にDeepFilterNet3を選べます。
+
 基本の録音操作は[READMEのユーザー向け説明書](../README.md)、画面ごとの操作は[詳しい操作手順](user-guide.md)を参照してください。
 
 ## 利用者向けの使い方

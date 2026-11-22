@@ -4,13 +4,13 @@
 //! and removed so the host's sample positions and tail are preserved.
 
 use df::tract::{DfParams, DfTract, RuntimeParams};
-use ndarray::{ArrayView2, ArrayViewMut2};
 use std::{
     ffi::{c_char, c_void, CStr},
     panic::{catch_unwind, AssertUnwindSafe},
     path::PathBuf,
     ptr, slice,
 };
+use tract_core::ndarray::{ArrayView2, ArrayViewMut2};
 
 const RATE: u32 = 48_000;
 const MAX_SAMPLES: usize = RATE as usize * 30;

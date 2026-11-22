@@ -2,6 +2,7 @@
 [CmdletBinding()]
 param(
     [string]$Destination = (Join-Path $PSScriptRoot '..\release\v0.1.0\plugins\deepfilternet3'),
+    [string]$TargetDirectory = (Join-Path $PSScriptRoot '..\local\plugin-build\deepfilter\target'),
     [switch]$SkipBuild
 )
 $ErrorActionPreference = 'Stop'
@@ -9,7 +10,7 @@ $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if (-not [IO.Path]::IsPathFullyQualified($Destination)) { throw 'Destinationは絶対パスで指定してください' }
 $destinationPath = [IO.Path]::GetFullPath($Destination)
 $buildRoot = Join-Path $projectRoot 'local\plugin-build\deepfilter'
-$targetRoot = Join-Path $buildRoot 'target'
+$targetRoot = [IO.Path]::GetFullPath($TargetDirectory)
 $manifestPath = Join-Path $projectRoot 'native-plugins\deepfilter\Cargo.toml'
 $revision = '7b14b895fe7fc42cab72b4a4c1e49c982bd6404b'
 $modelName = 'DeepFilterNet3_onnx.tar.gz'

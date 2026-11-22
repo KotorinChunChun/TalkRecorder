@@ -6,7 +6,7 @@ TalkRecorder ABI v1に対応する独立したRust DLLです。公式DeepFilterN
 
 - 上流：<https://github.com/Rikorose/DeepFilterNet>
 - リビジョン：`7b14b895fe7fc42cab72b4a4c1e49c982bd6404b`
-- 推論依存：上流が対象にしたtract関連crateを`0.21.4`へ厳密固定。後続0.21系のndarray／Graph API変更によるビルド不整合を避けます。
+- 推論依存：tract関連crateを`0.21.17`に固定。固定リビジョンのlibDFに互換修正を適用しています。 [取り込み元と差分](vendor/README.md)
 - モデル：`models/DeepFilterNet3_onnx.tar.gz`、7,983,136 bytes
 - モデルSHA-256：`c94d91f70911001c946e0fabb4aa9adc37045f45a03b56008cb0c8244cb63616`
 - 上流ソース・モデルのライセンス：MITまたはApache-2.0。準備スクリプトが同梱します。
